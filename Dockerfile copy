@@ -1,0 +1,45 @@
+FROM --platform=linux/amd64  my_huggingface_atten:v1 AS surgvu25Cat2
+# Use a 'large' base container to show-case how to load pytorch and use the GPU (when enabled)
+#FROM --platform=linux/amd64 pytorch/pytorch AS example-algorithm-amd64
+
+# Ensures that Python output to stdout/stderr is not buffered: prevents missing information when terminating
+ENV PYTHONUNBUFFERED=1
+
+## change apt source to aliyun
+RUN echo "deb https://mirrors.aliyun.com/ubuntu noble main restricted universe multiverse" > /etc/apt/sources.list && \
+    echo "deb https://mirrors.aliyun.com/ubuntu noble-updates main restricted universe multiverse" >> /etc/apt/sources.list && \
+    echo "deb https://mirrors.aliyun.com/ubuntu noble-backports main restricted universe multiverse" >> /etc/apt/sources.list && \
+    echo "deb https://mirrors.aliyun.com/ubuntu noble-security main restricted universe multiverse" >> /etc/apt/sources.list && \
+    rm -rf /etc/apt/sources.list.d/* && \
+    apt-get update && apt-get clean
+
+ENV DEBIAN_FRONTEND=noninteractive TZ=Asia/Shanghai
+
+RUN apt update && apt install -y openssh-server nano python3 python3-pip libgl1 \
+        && apt-get clean \
+        && rm -rf /var/lib/apt/lists/*
+RUN groupadd -r user && useradd -m --no-log-init -r -g user user
+USER user
+
+WORKDIR /opt/app
+
+COPY --chown=user:user requirements.txt /opt/app/
+COPY --chown=user:user resources /opt/app/resources
+COPY --chown=user:user model /opt/app/model
+
+## install proxy
+USER root
+RUN apt-get update && apt-get install -y proxychains4 \
+    && sed -i '/^socks/ s/^/#/' /etc/proxychains4.conf \
+    && echo "socks5 10.70.21.10 12306" >> /etc/proxychains4.conf
+USER user
+# You can add any Python dependencies to requirements.txt
+RUN proxychains4 pip install \
+    --user \
+    --no-cache-dir \
+    --no-color \
+    --requirement /opt/app/requirements.txt \
+    --break-system-packages
+
+COPY --chown=user:user inference.py /opt/app/
+ENTRYPOINT ["python", "inference.py"]
