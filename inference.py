@@ -24,18 +24,27 @@ Happy programming!
 from pathlib import Path
 import json
 from transformers import Qwen2_5_VLForConditionalGeneration, AutoProcessor
-from qwen_vl_utils import process_vision_info
+from qwen_vl_utils import process_vision_info, vision_process
 import torch
 
-INPUT_PATH = Path("/input")
-OUTPUT_PATH = Path("/output")
-# INPUT_PATH = Path("/data/zhaoxy/project/surgvu2025-category2-submission/test/input/interf0")
-# OUTPUT_PATH = Path("/data/zhaoxy/project/surgvu2025-category2-submission/test/output/interf0")
+# INPUT_PATH = Path("/input")
+# OUTPUT_PATH = Path("/output")
+INPUT_PATH = Path(
+    "/data/lxy/code/surgvu2025-category2-submission/test/input/interf0")
+OUTPUT_PATH = Path(
+    "/data/lxy/code/surgvu2025-category2-submission/test/output/interf0")
 RESOURCE_PATH = Path("resources")
 
 # # Global model and processor variables
 # model = None
 # processor = None
+
+def log_cuda_memory(message):
+    print(f"========== {message} ==========")
+    print("Allocated:", torch.cuda.memory_allocated(device="cuda:0")/1024**2, "MB")
+    print("Reserved :", torch.cuda.memory_reserved(device="cuda:0")/1024**2, "MB")
+    print("Max Allocated:", torch.cuda.max_memory_allocated(device="cuda:0")/1024**2, "MB")
+
 
 def load_model():
     """Load the model and processor globally"""
@@ -43,119 +52,93 @@ def load_model():
     
     # Load model from the checkpoint directory
     model = Qwen2_5_VLForConditionalGeneration.from_pretrained(
-        "/opt/app/model",  # Updated path for container
+        # "/opt/app/model",  # Updated path for container
+        "/data/lxy/code/surgvu2025-category2-submission/model",
         torch_dtype=torch.bfloat16,
         device_map="cuda:0",  # Force all model parts to use cuda:0
     )
-    
+
+    model.eval()
     # Load processor
     # processor = AutoProcessor.from_pretrained("/opt/app/model")
-    processor = AutoProcessor.from_pretrained("/opt/app/model")
+    processor = AutoProcessor.from_pretrained(
+        "/data/lxy/code/surgvu2025-category2-submission/model")
 
-def analyze_video(video_path, video_messages):
-    """Analyze video and return description"""
-    system_prompt = """
-    You are an expert surgical video analysis assistant.
 
-## Primary Objective
-Analyze the surgical video and output findings in EXACTLY the following 4 steps, in order.
-## Step 1 — Surgical Task
-- Describe in detail the main surgical task being performed in the video.
-- Keep the description precise and specific to the procedure context.
+def build_qwen_input_by_file(file_path, input_text, vision_type="video", frames=8):
 
-## Step 2 — Tools count Used
-- Recognize the numeber of the visiable tools
+    messages = [
+        {
+            "role": "user",
+            "content": [
+                {
+                    "type": vision_type,
+                    vision_type: f"{file_path}",
+                    "resized_height": 480,
+                    "resized_width": 854,
+                },
+                {"type": "text", "text": input_text},
+            ],
+        }
+    ]
+    try:
+        # 处理视频
+        vision_process.FPS_MAX_FRAMES = frames
+        vision_process.FPS_MIN_FRAMES = frames
+        image_inputs, video_inputs = process_vision_info(
+            messages)  # 获取数据（预处理过）
 
-## Step 3 — Tools Used name
-- List **all** tools visible/used in the video. DO NOT list the tools not seen in the video.
+        print(f'input tensor shape {video_inputs[0].shape}')
+    except Exception as e:
+        print(f"处理视频文件时出错: {e}")
+        return None
 
-## Step 4 — Surgical Action
-- Describe the precise action being performed (e.g., suturing, dissecting, clipping, cauterizing, stapling, retracting).
-- Avoid vague verbs like "working" or "handling".
-
-## Step 5 — Anatomy / Organ(s) Involved
-- Identify the anatomical structure(s) being operated on.
-- Use standard anatomical terms.
-- If multiple structures are involved, list them all.
----
-## Output Format
-Your output must follow this **exact format**:
-Step 1 — Surgical Task: <detailed task description>  
-Step 2 — Count the number of tools used: 
-Step 3 - <comma-separated list of used tools name in the video>  
-Step 4 — Surgical Action: <precise action description>
-Step 5 — Anatomy: <list of anatomical structures>  
-
-    ---
-    """
-    # 只用视频消息 + system prompt
-    messages = [{"role": "system", "content": system_prompt}] + video_messages 
-
+    # 获取文本
     text = processor.apply_chat_template(
         messages, tokenize=False, add_generation_prompt=True
     )
-    image_inputs, video_inputs = process_vision_info(messages)
+
+    # 获取输入
     inputs = processor(
         text=[text],
-        images=image_inputs,
+        # images=image_inputs,
         videos=video_inputs,
         padding=True,
         return_tensors="pt",
     )
-    inputs = inputs.to(model.device)
 
-    # Inference: Generation of the output
-    generated_ids = model.generate(**inputs, max_new_tokens=128)
+    return inputs
+
+
+def infer(file_path, input_text):
+    inputs = build_qwen_input_by_file(
+         file_path, input_text, vision_type="video", frames=8).to("cuda:0")
+
+    # 打印inputs的属性
+    for k, v in inputs.items():
+        if hasattr(v, "shape"):
+            print(f"{k:20s} shape={tuple(v.shape)}, dtype={v.dtype}, device={v.device}")
+        else:
+            print(f"{k:20s} value={v}")
+
+    log_cuda_memory("before generate")
+    with torch.no_grad():
+        generated_ids = model.generate(**inputs, max_new_tokens=128)
     generated_ids_trimmed = [
-        out_ids[len(in_ids) :] for in_ids, out_ids in zip(inputs.input_ids, generated_ids)
+        out_ids[len(in_ids):] for in_ids, out_ids in zip(inputs.input_ids, generated_ids)
     ]
     output_text = processor.batch_decode(
         generated_ids_trimmed, skip_special_tokens=True, clean_up_tokenization_spaces=False
     )
+    log_cuda_memory("after generate")
     return output_text[0] if output_text else ""
 
-def answer_question(video_description, user_question, video_messages):
-    """Answer question based on video description and question"""
-    prompt = f"""
-You are a precise question answering assistant.
-You are only allowed to answer based on the Video description to answer the user's question.Do NOT add any information not contained in the description.If a tool is not explicitly listed in Step 3, your answer must be "No".
-There should be logic before and after answering.
-
-
-    Video description:
-    {video_description}
-
-    User question:
-    {user_question}
-    Answer concisely.
-    Please output in clear, briefly,structured natural language in one sentence less than 10 words.
-    """
-    
-    messages = [
-        {"role": "system", "content": prompt},
-        {"role": "user", "content": user_question}
-    ]
-    text = processor.apply_chat_template(messages, tokenize=False, add_generation_prompt=True)
-    inputs = processor(
-        text=[text],
-        padding=True,
-        return_tensors="pt",
-    )
-    inputs = inputs.to(model.device)
-
-    # Inference: Generation of the output
-    generated_ids = model.generate(**inputs, max_new_tokens=128)
-    generated_ids_trimmed = [
-        out_ids[len(in_ids) :] for in_ids, out_ids in zip(inputs.input_ids, generated_ids)
-    ]
-    output_text = processor.batch_decode(
-        generated_ids_trimmed, skip_special_tokens=True, clean_up_tokenization_spaces=False
-    )
-    return output_text[0] if output_text else ""
 
 def run():
+    log_cuda_memory("before load model")
     # Load model first
     load_model()
+    log_cuda_memory("after load model")
     
     # The key is a tuple of the slugs of the input sockets
     interface_key = get_interface_key()
@@ -182,27 +165,12 @@ def interf0_handler():
 
     # Prepare video messages for the model
     video_path = str(input_endoscopic_robotic_surgery_video)
-    video_messages = [
-        {"role": "user", "content": [
-            {"type": "video",
-             "video": video_path,
-             "total_pixels": 10240 * 28 * 28,
-             "min_pixels": 16 * 28 * 2,
-             "fps": 0.15
-            }
-        ]}
-    ]
     
-    # Step 1: Analyze video to get description
-    print("Analyzing video...")
-    video_description = analyze_video(video_path, video_messages)
-    print("Video description:\n", video_description)
-    
-    # Step 2: Answer the question using video description and question
-    user_question = input_visual_context_question  # The question is directly a string
+    user_question = input_visual_context_question
     print("Answering question:", user_question)
-    answer = answer_question(video_description, user_question, video_messages)
+    answer = infer(video_path, input_visual_context_question)
     print("Answer:\n", answer)
+
     
     # # Save your output
     # output_visual_context_response = {
@@ -215,6 +183,8 @@ def interf0_handler():
     )
     print('output saved to  ', OUTPUT_PATH)
 
+    peak_memory = torch.cuda.max_memory_allocated(device="cuda:0") / 1024**2
+    print("Peak memory usage:", peak_memory, "MiB")
     return 0
 
 

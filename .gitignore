@@ -1,2 +1,5 @@
 model_zxy/
 model/
+Qwen2.5-VL-3B-Surgery/
+*.tar.gz
+docker/

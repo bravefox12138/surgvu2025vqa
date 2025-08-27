@@ -1,4 +1,4 @@
-FROM --platform=linux/amd64 my_huggingface_atten:v1 AS surgvu25Cat2
+FROM --platform=linux/amd64 huggingface/transformers-pytorch-gpu:latest AS surgvu25cat2
 
 ENV PYTHONUNBUFFERED=1 \
     DEBIAN_FRONTEND=noninteractive \
