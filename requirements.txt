@@ -1,2 +1,6 @@
 transformers==4.51.3 
 qwen-vl-utils[decord]
+ultralytics
+timm
+Pillow
+configparser

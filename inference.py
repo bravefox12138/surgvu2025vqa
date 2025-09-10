@@ -27,13 +27,22 @@ from transformers import Qwen2_5_VLForConditionalGeneration, AutoProcessor
 from qwen_vl_utils import process_vision_info, vision_process
 import torch
 import os
+import csv
+import configparser
+import logging
+from timm.models import create_model
+import torchvision.transforms as transforms
 
 INPUT_PATH = Path("/input")
 OUTPUT_PATH = Path("/output")
+MODEL_PATH = Path("/opt/app/model")
+
 # INPUT_PATH = Path(
 #     "/data/lxy/code/surgvu2025-category2-submission/test/input/interf0")
 # OUTPUT_PATH = Path(
 #     "/data/lxy/code/surgvu2025-category2-submission/test/output/interf0")
+# MODEL_PATH = Path("/data/lxy/code/surgvu2025-category2-submission/model")
+
 RESOURCE_PATH = Path("resources")
 
 # # Global model and processor variables
@@ -52,21 +61,50 @@ def log_cuda_memory(message):
 
 def load_model():
     """Load the model and processor globally"""
+    
+    global config
+    config = configparser.ConfigParser()
+    config.read(os.path.join(MODEL_PATH, "alg.cfg"), encoding='utf-8')
+
+    global det_model, cls_model, cls_transform, device
+    det_model_path = os.path.join(MODEL_PATH, "last.pt")
+    cls_model_path = os.path.join(MODEL_PATH, "checkpoint-best-ema_224.pth")
+    device = "cuda" if torch.cuda.is_available() else "cpu"
+
+    # 初始化检测模型
+    from ultralytics.utils import LOGGER
+    LOGGER.setLevel(logging.ERROR)  # 只显示错误
+    from ultralytics import YOLO
+    det_model = YOLO(det_model_path)
+
+    # 分类模型可选，如果不需要可以设置为 None
+    cls_model = create_model("resnet50", pretrained=False, num_classes=12)
+    import numpy as np
+    # with torch.serialization.safe_globals([np.core.multiarray.scalar]):
+    checkpoint = torch.load(
+        cls_model_path, map_location="cpu", weights_only=False)['model']
+    # 这里假设 load_state_dict 函数已定义
+    load_state_dict(cls_model, checkpoint)
+    cls_model.to(device)
+    cls_model.eval()
+    cls_transform = transforms.Compose([
+        transforms.Resize((224, 224)),
+        transforms.ToTensor(),
+        transforms.Normalize([0.485, 0.456, 0.406], [0.229, 0.224, 0.225])
+    ])
+
     global model, processor
     
     # Load model from the checkpoint directory
     model = Qwen2_5_VLForConditionalGeneration.from_pretrained(
-        "/opt/app/model",  # Updated path for container
-        # "/data/lxy/code/surgvu2025-category2-submission/model",
+        MODEL_PATH,  # Updated path for container
         torch_dtype=torch.bfloat16,
         device_map="cuda:0",  # Force all model parts to use cuda:0
     )
 
     model.eval()
     # Load processor
-    processor = AutoProcessor.from_pretrained("/opt/app/model", use_fast=True)
-    # processor = AutoProcessor.from_pretrained(
-    #     "/data/lxy/code/surgvu2025-category2-submission/model")
+    processor = AutoProcessor.from_pretrained(MODEL_PATH, use_fast=True)
 
 
 def build_qwen_input_by_file(messages, frames=4):
@@ -109,6 +147,232 @@ def infer_by_message(messages, model):
         generated_ids_trimmed, skip_special_tokens=True, clean_up_tokenization_spaces=False
     )
     return output_text[0]
+
+
+def load_state_dict(model, state_dict, prefix='', ignore_missing="relative_position_index"):
+    missing_keys = []
+    unexpected_keys = []
+    error_msgs = []
+    # copy state_dict so _load_from_state_dict can modify it
+    metadata = getattr(state_dict, '_metadata', None)
+    state_dict = state_dict.copy()
+    if metadata is not None:
+        state_dict._metadata = metadata
+
+    def load(module, prefix=''):
+        local_metadata = {} if metadata is None else metadata.get(
+            prefix[:-1], {})
+        module._load_from_state_dict(
+            state_dict, prefix, local_metadata, True, missing_keys, unexpected_keys, error_msgs)
+        for name, child in module._modules.items():
+            if child is not None:
+                load(child, prefix + name + '.')
+
+    load(model, prefix=prefix)
+
+    warn_missing_keys = []
+    ignore_missing_keys = []
+    for key in missing_keys:
+        keep_flag = True
+        for ignore_key in ignore_missing.split('|'):
+            if ignore_key in key:
+                keep_flag = False
+                break
+        if keep_flag:
+            warn_missing_keys.append(key)
+        else:
+            ignore_missing_keys.append(key)
+
+    missing_keys = warn_missing_keys
+
+    if len(missing_keys) > 0:
+        print("Weights of {} not initialized from pretrained model: {}".format(
+            model.__class__.__name__, missing_keys))
+    if len(unexpected_keys) > 0:
+        print("Weights from pretrained model not used in {}: {}".format(
+            model.__class__.__name__, unexpected_keys))
+    if len(ignore_missing_keys) > 0:
+        print("Ignored weights of {} not initialized from pretrained model: {}".format(
+            model.__class__.__name__, ignore_missing_keys))
+    if len(error_msgs) > 0:
+        print('\n'.join(error_msgs))
+
+def extract_tools_list(video_path, det_model, id_label_dict, cls_model=None, cls_transform=None, device="cuda"):
+    """
+    输入视频路径，返回视频中出现过的手术工具列表（去重）。
+    """
+    import cv2
+    import torch
+    import numpy as np
+    from PIL import Image
+    cap = cv2.VideoCapture(video_path)
+    fps = int(cap.get(cv2.CAP_PROP_FPS))  # 帧率
+    frame_interval = max(fps * 1, 1)      # 每 2 秒取一帧
+    frame_idx = 0
+
+    tools_set = set()
+    prev_tools = set()  # 保存上一帧的检测结果
+
+    while cap.isOpened():
+        success, frame = cap.read()
+        if not success:
+            break
+
+        if frame_idx % frame_interval == 0:
+            current_tools = set()
+
+            # 检测
+            det_res = det_model.predict(frame, conf=0.65, iou=0.3)[0]
+            boxes = det_res.boxes.xyxy.cpu().numpy().astype(np.int32)
+            clses = det_res.boxes.cls.cpu().numpy().astype(np.int32)
+
+            for i in range(len(boxes)):
+                det_cls = clses[i]
+                det_label = id_label_dict[det_cls]
+
+                # 可选分类模型
+                if cls_model is not None and cls_transform is not None:
+                    x1, y1, x2, y2 = boxes[i]
+                    h, w = frame.shape[:2]
+                    bw, bh = x2 - x1, y2 - y1
+                    xmin = max(x1 - bw // 2, 0)
+                    ymin = max(y1 - bh // 2, 0)
+                    xmax = min(x2 + bw // 2, w)
+                    ymax = min(y2 + bh // 2, h)
+                    if xmin < xmax and ymin < ymax:
+                        crop = frame[ymin:ymax, xmin:xmax, :]
+                        crop_rgb = cv2.cvtColor(crop, cv2.COLOR_BGR2RGB)
+                        crop_rgb = Image.fromarray(crop_rgb)
+                        image_trans = cls_transform(crop_rgb).unsqueeze(0).to(device)
+                        with torch.no_grad():
+                            res = cls_model(image_trans)
+                            output = torch.softmax(res, dim=1).detach().cpu().numpy()
+                            cls_id = np.argmax(output, axis=1)[0]
+                            det_label = id_label_dict[cls_id]
+
+                current_tools.add(det_label)
+
+            # 取和上一帧的交集 → 连续两帧都出现的工具才加入最终结果
+            stable_tools = prev_tools & current_tools
+            tools_set.update(stable_tools)
+
+            # 更新上一帧
+            prev_tools = current_tools
+
+        frame_idx += 1
+
+    cap.release()
+    return sorted(list(tools_set))
+
+def detect_tool_list(video_path):
+    id_label_dict = {0: 'needle driver',
+                     1: 'monopolar curved scissors',
+                     2: 'force bipolar',
+                     3: 'clip applier',
+                     4: 'cadiere forceps',
+                     5: 'bipolar forceps',
+                     6: 'vessel sealer',
+                     7: 'permanent cautery hook spatula',
+                     8: 'prograsp forceps',
+                     9: 'stapler',
+                     10: 'grasping retractor',
+                     11: 'tip-up fenestrated grasper'}
+
+    tools_list = extract_tools_list(
+        video_path, det_model, id_label_dict, cls_model, cls_transform, device)
+    print("Detected tools:", tools_list)
+
+    return tools_list
+
+def load_commercial2gt(csv_path):
+    """
+    读取 CSV, 返回 commercial2gt 映射 (lowercase key)
+    """
+    mapping = {}
+    with open(csv_path, "r", encoding="utf-8-sig") as f:
+        reader = csv.DictReader(f)
+        for row in reader:
+            c_name = row["commercial_toolname"].strip().lower()
+            g_name = row["groundtruth_toolname"].strip()
+            mapping[c_name] = g_name
+    return mapping
+
+def merge_tools(video_description, tools_list, commercial2gt):
+    """
+    合并检测模型 tools_list 和 Qwen 输出的 JSON
+    - tools_list 决定最终有哪些工具
+    - 如果 Qwen 有对应描述，就优先保留它的 commercial 名
+    - 否则用 groundtruth 名
+    """
+    def normalize_name(name):
+        return name.strip().lower()
+
+    # Step 1. 把检测模型输出 tools_list 映射到 groundtruth
+    gt_tools = set()
+    for tool in tools_list:
+        tool_norm = normalize_name(tool)
+        gt_name = commercial2gt.get(tool_norm, tool)
+        gt_tools.add(gt_name)
+
+    # Step 2. 遍历 Qwen 输出
+    desc_dict = {}
+    commercial_name_dict = {}
+    if "used_tools_and_function" in video_description:
+        for name, func in video_description["used_tools_and_function"].items():
+            name_norm = normalize_name(name)
+            gt_name = commercial2gt.get(name_norm, name)
+            if gt_name in gt_tools:  # 必须检测模型确认过
+                desc_dict[gt_name] = func
+                commercial_name_dict[gt_name] = name  # 保留 Qwen 原始 commercial 名
+
+    # Step 3. 合并
+    merged = {}
+    for gt_name in gt_tools:
+        key_name = commercial_name_dict.get(
+            gt_name, gt_name)  # 优先保留 Qwen commercial 名
+        merged[key_name] = desc_dict.get(gt_name, " ")
+
+    # Step 4. 为新的tools list添加function
+    gt_tools_function_map = {
+        "monopolar curved scissors": "Used for tissue cutting and dissection, providing monopolar electrosurgical energy for cutting and coagulation.",
+        "force bipolar": "Used for tissue cutting and dissection, providing bipolar electrosurgical energy for cutting and coagulation.",
+        "permanent cautery hook spatula": "Used for tissue dissection, blunt dissection, and cauterization.",
+        "stapler": "Used for tissue or vessel transection, sealing, and stapling.",
+        "needle driver": "Used for holding needles, suturing, and knot tying.",
+        "bipolar forceps": "Used for grasping tissue and providing bipolar coagulation for hemostasis.",
+        "suction irrigator": "Used for irrigating, aspirating fluids, and clearing the surgical field.",
+        "synchroseal": "Used for sealing, cutting, and achieving hemostasis in tissue.",
+        "bipolar dissector": "Used for tissue dissection with bipolar coagulation capability.",
+        "clip applier": "Used for vessel or duct occlusion through clip application.",
+        "cadiere forceps": "Used for grasping, retracting, and dissecting tissue.",
+        "crocodile grasper": "Used for tissue grasping and traction.",
+        "vessel sealer": "Used for vessel sealing, hemostasis, and tissue division.",
+        "tip-up fenestrated grasper": "Used for tissue retraction, exposure, and dissection.",
+        "prograsp forceps": "Used for strong grasping and holding of thick or firm tissue.",
+        "grasping retractor": "Used for tissue retraction and exposure of the surgical field.",
+        "tenaculum forceps": "Used for firmly grasping and stabilizing tissue or organs.",
+        "potts scissors": "Used for fine dissection and cutting of vessels or ducts."
+    }
+    
+    for key, value in merged.items():
+        if value is None or value == " " or value == "":
+            if key in gt_tools_function_map:
+                merged[key] = gt_tools_function_map[key]
+            else:
+                merged[key] = " "
+
+    # 现在是 dict，可以安全更新
+    video_description["used_tools_and_function"] = merged
+    return video_description
+
+def filter_tools(file_path, description_json):
+    use_tools_filter = config.getboolean('ALG', 'use_tools_filter', fallback=True)
+    if use_tools_filter:
+        tools_list = detect_tool_list(file_path)
+        commercial2gt = load_commercial2gt(
+            os.path.join(MODEL_PATH, "toolname_mapping_filter.csv"))
+        description_json = merge_tools(description_json, tools_list, commercial2gt)
+    return description_json
 
 
 def deepthink_infer_by_file(file_path, input_text):
@@ -190,60 +454,68 @@ def deepthink_infer_by_file(file_path, input_text):
     })
 
     structure = infer_by_message(messages, model)
-    structure_json = json.loads(structure)
-    # 1.1 去除特殊疑问词
-    special_words = ["what", "which", "who", "whom", "whose", "when", "where", "why", "how", "how many", "how much",
-                     "how long", "how often", "how far", "how big", "how small", "how heavy", "how light",
-                     "how tall", "how short", "how wide", "how deep", "how thick", "how thin", "how long",
-                     "how short", "how wide", "how deep", "how thick", "how thin"]
-    if input_text.lower().split(" ")[0] in special_words:
-        structure_json["type"] = "special"
-    else:
-        structure_json["type"] = "normal"
 
-    if structure_json["structure"] == "S-LV-P":
-        for key, value in structure_json.items():
-            if value is None:
-                continue
-            for word in special_words:
-                if word in value.lower().split(" "):
-                    structure_json[key] = value.lower().replace(word, "")
-    # 1.2 去除表语中的状语
-    if structure_json["structure"] == "S-LV-P":
-        if structure_json['adverbial'] is not None and structure_json["predicative"] is not None:
-            if structure_json['adverbial'] in structure_json["predicative"]:
-                structure_json["predicative"] = structure_json["predicative"].replace(
-                    structure_json['adverbial'], "")
-    # 1.3 特殊疑问句将主语上添加限定词
-    definite_words = ["the", "this", "an",
-                      "a", "these", "that", "those", "such"]
-    indefinite_words = ["some", "any", "all", "both",
-                        "each", "every", "many", "much", "few"]
-    if structure_json["type"] == "special":
+    try:
+        structure_json = json.loads(structure)
+        # 1.1 去除特殊疑问词
+        special_words = ["what", "which", "who", "whom", "whose", "when", "where", "why", "how", "how many", "how much",
+                         "how long", "how often", "how far", "how big", "how small", "how heavy", "how light",
+                         "how tall", "how short", "how wide", "how deep", "how thick", "how thin", "how long",
+                         "how short", "how wide", "how deep", "how thick", "how thin"]
+        if input_text.lower().split(" ")[0] in special_words:
+            structure_json["type"] = "special"
+        else:
+            structure_json["type"] = "normal"
+
+        if structure_json["structure"] == "S-LV-P":
+            for key, value in structure_json.items():
+                if value is None:
+                    continue
+                for word in special_words:
+                    if word in value.lower().split(" "):
+                        structure_json[key] = value.lower().replace(word, "")
+        # 1.2 去除表语中的状语
+        if structure_json["structure"] == "S-LV-P":
+            if structure_json['adverbial'] is not None and structure_json["predicative"] is not None:
+                if structure_json['adverbial'] in structure_json["predicative"]:
+                    structure_json["predicative"] = structure_json["predicative"].replace(
+                        structure_json['adverbial'], "")
+        # 1.3 特殊疑问句将主语上添加限定词
+        definite_words = ["the", "this", "an",
+                          "a", "these", "that", "those", "such"]
+        indefinite_words = ["some", "any", "all", "both",
+                            "each", "every", "many", "much", "few"]
+
         if structure_json["subject"] is not None:
-            has_definite_word = False
             for word in indefinite_words:
                 if word in structure_json["subject"].lower().split(" "):
                     structure_json["subject"] = structure_json["subject"].lower().replace(
                         word, "")
-            for word in definite_words:
-                if word in structure_json["subject"].lower().split(" "):
-                    has_definite_word = True
-                    break
-            if not has_definite_word:
-                structure_json["subject"] = "The " + \
-                    structure_json["subject"].lower()
 
-    # 1.4 如果系动词是being, 则改为is
-    if structure_json["linking_verb"] == "being":
-        structure_json["linking_verb"] = "is"
+        if structure_json["type"] == "special":
+            if structure_json["subject"] is not None:
+                has_definite_word = False
+                for word in definite_words:
+                    if word in structure_json["subject"].lower().split(" "):
+                        has_definite_word = True
+                        break
+                if not has_definite_word:
+                    structure_json["subject"] = "The " + \
+                        structure_json["subject"].lower()
 
-    # 1.5 将所有字符串中的"  "替换为" "
-    for key, value in structure_json.items():
-        if value is not None:
-            structure_json[key] = value.replace("  ", " ")
+        # 1.4 如果系动词是being, 则改为is
+        if structure_json["linking_verb"] == "being":
+            structure_json["linking_verb"] = "is"
 
-    print(structure_json)
+        # 1.5 将所有字符串中的"  "替换为" "
+        for key, value in structure_json.items():
+            if value is not None:
+                structure_json[key] = value.replace("  ", " ")
+
+        print(structure_json)
+    except:
+        print(f"Error: {structure}")
+        structure_json = None
 
     # 1. get the description of the surgery
     messages = []
@@ -266,6 +538,9 @@ def deepthink_infer_by_file(file_path, input_text):
 
     if ("monopolar curved scissors" in description_json["used_tools_and_function"].keys()):
         description_json["used_tools_and_function"]["monopolar curved scissors"] = "tissue cut and dissection, while also providing monopolar electrosurgical energy for cutting and coagulation during minimally invasive procedures."
+
+    # 1.1 filter tools list by detect model
+    description_json = filter_tools(file_path, description_json)
 
     # 2. get the actions of the surgery
     action_list = ["dissection", "cut", "cut tissue", "hemostasis", "suture", "knotting",
@@ -302,104 +577,6 @@ def deepthink_infer_by_file(file_path, input_text):
     print(description_json)
 
     # 3. answer the user's question
-    prompt_normal = f"""
-        You are a precise question answering assistant. You are given a laparoscopic surgery(endoscopic surgery) video description.
-    You are only allowed to answer based on the Video description to answer the user's question.Do NOT add any information not contained in the description.
-    There should be logic before and after answering.
-    Your task is to answer questions strictly following the predefined response style.
-    
-    Answering Rules:
-        1. instrument presence questions(used_tools_and_function contains the instrument in use):
-        - If a tool is explicitly listed in used_tools_and_function, answer with: "Yes, [instrument] are being used." / "Yes, a [instrument] was used."
-        - If a tool is not listed in used_tools_and_function, answer with: "No [instrument] are being used." / "No [instrument] is being used."
-
-        2. what type of [instrument class] is mentioned?
-        - Answer with one short sentence starting with "The type of [instrument class] mentioned is [instrument]"
-
-        3. used_tools_and_function list check questions ("Is a [instrument] among the listed tools?"):
-        - If listed: "Yes, a [instrument] is listed."
-        - If not listed: "No, a [instrument] is not listed."
-
-        4. actions list check questions ("Is a [action] required in this surgical step?"):
-        - Answer with yes/no + requirement: 
-            e.g., "Yes, the procedure involves [action]." / "No, [action] are not required."
-        
-        5. Requirement questions ("Is a [task] required in this surgical step?"):
-        - Answer with yes/no + requirement: 
-            e.g., "Yes, the procedure involves [action]." / "No, [task] are not required."
-
-        6. Organ/tissue manipulation questions ("What organ is being manipulated?"):
-        - Answer with one short sentence starting with: The organ being manipulated is the [organ]."
-
-        7. Procedure identification questions ("What procedure is this summary describing?"):
-        - Answer with one short sentence starting with "The summary is describing [procedure]."
-
-        8. Purpose/function questions ("What is the purpose of using [tool] in this procedure?"):
-        - Answer with one short sentence starting with: "The [tool] are used for [function]."
-   
-
-    Video description:
-    {description_json}
-
-    User question:
-    {input_text}
-
-    Please organize your answer in the following format:
-        if Yes: Yes, {structure_json["subject"]} {structure_json["linking_verb"]} {structure_json["predicative"]}
-        if No: No, {structure_json["subject"]} {structure_json["linking_verb"]} not {structure_json["predicative"]}
-    Answer concisely, logically, and less than 10 words
-
-    """
-
-    # 3. answer the user's question
-    prompt_special = f"""
-        You are a precise question answering assistant. You are given a laparoscopic surgery(endoscopic surgery) video description.
-    You are only allowed to answer based on the Video description to answer the user's question.Do NOT add any information not contained in the description.
-    There should be logic before and after answering.
-    Your task is to answer questions strictly following the predefined response style.
-    
-    Answering Rules:
-        1. instrument presence questions(used_tools_and_function contains the instrument in use):
-        - If a tool is explicitly listed in used_tools_and_function, answer with: "Yes, [instrument] are being used." / "Yes, a [instrument] was used."
-        - If a tool is not listed in used_tools_and_function, answer with: "No [instrument] are being used." / "No [instrument] is being used."
-
-        2. what type of [instrument class] is mentioned?
-        - Answer with one short sentence starting with "The type of [instrument class] mentioned is [instrument]"
-
-        3. used_tools_and_function list check questions ("Is a [instrument] among the listed tools?"):
-        - If listed: "Yes, a [instrument] is listed."
-        - If not listed: "No, a [instrument] is not listed."
-
-        4. actions list check questions ("Is a [action] required in this surgical step?"):
-        - Answer with yes/no + requirement: 
-            e.g., "Yes, the procedure involves [action]." / "No, [action] are not required."
-        
-        5. Requirement questions ("Is a [task] required in this surgical step?"):
-        - Answer with yes/no + requirement: 
-            e.g., "Yes, the procedure involves [action]." / "No, [task] are not required."
-
-        6. Organ/tissue manipulation questions ("What organ is being manipulated?"):
-        - Answer with one short sentence starting with: The organ being manipulated is the [organ]."
-
-        7. Procedure identification questions ("What procedure is this summary describing?"):
-        - Answer with one short sentence starting with "The summary is describing [procedure]."
-
-        8. Purpose/function questions ("What is the purpose of using [tool] in this procedure?"):
-        - Answer with one short sentence starting with: "The [tool] are used for [function]."
-   
-
-    Video description:
-    {description_json}
-
-    User question:
-    {input_text}
-
-    Please organize your answer in the following format:
-        {structure_json["subject"]} {structure_json["predicative"]} {structure_json["linking_verb"]} [answer from description]
-    Answer concisely, logically, and less than 10 words
-
-    """
-
     prompt = f"""
         You are a precise question answering assistant. You are given a laparoscopic surgery(endoscopic surgery) video description.
     You are only allowed to answer based on the Video description to answer the user's question.Do NOT add any information not contained in the description.
@@ -444,9 +621,66 @@ def deepthink_infer_by_file(file_path, input_text):
     Answer concisely, logically, and less than 10 words
     """
 
-    if structure_json["linking_verb"] is not None:
-        prompt = prompt_normal if structure_json["type"] == "normal" else prompt_special
+    if structure_json is not None and structure_json["linking_verb"] is not None:
+        if structure_json["type"] == "normal":
+            structure_prompt = f"""
+            if Yes: Yes, {structure_json["subject"]} {structure_json["linking_verb"]} {structure_json["predicative"]}
+            if No: No, {structure_json["subject"]} {structure_json["linking_verb"]} not {structure_json["predicative"]}
+            """
+        elif structure_json["type"] == "special":
+            if "why" in input_text.lower().split(" "):
+                structure_prompt = f"""
+                because {structure_json["subject"]} [answer from description]
+                """
+            else:
+                structure_prompt = f"""
+                {structure_json["subject"]} {structure_json["predicative"]} {structure_json["linking_verb"]} [answer from description]
+                """
+            prompt = f"""
+                You are a precise question answering assistant. You are given a laparoscopic surgery(endoscopic surgery) video description.
+            You are only allowed to answer based on the Video description to answer the user's question.Do NOT add any information not contained in the description.
+            There should be logic before and after answering.
+            Your task is to answer questions strictly following the predefined response style.
+            
+            Answering Rules:
+                1. instrument presence questions(used_tools_and_function contains the instrument in use):
+                - If a tool is explicitly listed in used_tools_and_function, answer with: "Yes, [instrument] are being used." / "Yes, a [instrument] was used."
+                - If a tool is not listed in used_tools_and_function, answer with: "No [instrument] are being used." / "No [instrument] is being used."
 
+                2. what type of [instrument class] is mentioned?
+                - Answer with one short sentence starting with "The type of [instrument class] mentioned is [instrument]"
+
+                3. used_tools_and_function list check questions ("Is a [instrument] among the listed tools?"):
+                - If listed: "Yes, a [instrument] is listed."
+                - If not listed: "No, a [instrument] is not listed."
+
+                4. actions list check questions ("Is a [action] required in this surgical step?"):
+                - Answer with yes/no + requirement: 
+                    e.g., "Yes, the procedure involves [action]." / "No, [action] are not required."
+                
+                5. Requirement questions ("Is a [task] required in this surgical step?"):
+                - Answer with yes/no + requirement: 
+                    e.g., "Yes, the procedure involves [action]." / "No, [task] are not required."
+
+                6. Organ/tissue manipulation questions ("What organ is being manipulated?"):
+                - Answer with one short sentence starting with: The organ being manipulated is the [organ]."
+
+                7. Procedure identification questions ("What procedure is this summary describing?"):
+                - Answer with one short sentence starting with "The summary is describing [procedure]."
+
+                8. Purpose/function questions ("What is the purpose of using [tool] in this procedure?"):
+                - Answer with one short sentence starting with: "The [tool] are used for [function]."
+        
+
+            Video description:
+            {description_json}
+
+            User question:
+            {input_text}
+
+            Please organize your answer in the following format:{structure_prompt}
+            Answer concisely, logically, and less than 10 words
+            """
     messages = []
     messages.append({
         "role": "user",
@@ -456,37 +690,39 @@ def deepthink_infer_by_file(file_path, input_text):
     })
 
     response = infer_by_message(messages, model)
-    print(response)
 
-    subject = structure_json["subject"] if structure_json["type"] == "normal" else structure_json["subject"] + \
-        " " + structure_json["predicative"]
+    # 4. simplify the answer
+    answer_word_num = len(response.split(" "))
+    if structure_json is not None and answer_word_num > 10:
 
-    prompt_rebuild = f"""You are an assistant that simplifies answers when the number of words exceeds 11.
-        Task:  
-        Please keep the subject "{subject}" unchanged. 
-        Simplify the part of the sentence after the "{subject}", make sure the entire sentence is no more than 11 words.
+        subject = structure_json["subject"] if structure_json["type"] == "normal" else structure_json["subject"] + \
+            " " + structure_json["predicative"]
 
-        Examples:  
+        prompt_rebuild = f"""You are an assistant that simplifies answers.
+            Task:  
+            Please keep the subject "{subject}" and linking verb "{structure_json["linking_verb"]}" unchanged. 
+            Simplify the part of the sentence after the "{subject}", make sure the entire sentence is no more than 11 words.
+            
+            Examples:  
 
-        Input: "The purpose of using forceps in this procedure is to grasp tissue safely and securely."  
-        Output: "The purpose of using forceps is to grasp tissue safely."
+            Input: "The purpose of using forceps in this procedure is to grasp tissue safely and securely."  
+            Output: "The purpose of using forceps is to grasp tissue safely."
 
-        Input: "Yes, a large needle driver is among the listed tools used here in surgery."  
-        Output: "Yes, a large needle driver is among the listed tools."
+            Input: "Yes, a large needle driver is among the listed tools used here in surgery."  
+            Output: "Yes, a large needle driver is among the listed tools."
 
-        Now simplify the following answer, keeping the subject and linking verb unchanged:  
-        "{response}"
+            Now simplify the following answer, keeping the subject and linking verb unchanged:  
+            "{response}"
+        """
 
-    """
-
-    messages = []
-    messages.append({
-        "role": "user",
-        "content": [
-            {"type": "text", "text": prompt_rebuild},
-        ],
-    })
-    response = infer_by_message(messages, model)
+        messages = []
+        messages.append({
+            "role": "user",
+            "content": [
+                {"type": "text", "text": prompt_rebuild},
+            ],
+        })
+        response = infer_by_message(messages, model)
 
     return response
 
