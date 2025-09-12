@@ -33,15 +33,15 @@ import logging
 from timm.models import create_model
 import torchvision.transforms as transforms
 
-INPUT_PATH = Path("/input")
-OUTPUT_PATH = Path("/output")
-MODEL_PATH = Path("/opt/app/model")
+# INPUT_PATH = Path("/input")
+# OUTPUT_PATH = Path("/output")
+# MODEL_PATH = Path("/opt/app/model")
 
-# INPUT_PATH = Path(
-#     "/data/lxy/code/surgvu2025-category2-submission/test/input/interf0")
-# OUTPUT_PATH = Path(
-#     "/data/lxy/code/surgvu2025-category2-submission/test/output/interf0")
-# MODEL_PATH = Path("/data/lxy/code/surgvu2025-category2-submission/model")
+INPUT_PATH = Path(
+    "/data/lxy/code/surgvu2025-category2-submission/test/input")
+OUTPUT_PATH = Path(
+    "/data/lxy/code/surgvu2025-category2-submission/test/output")
+MODEL_PATH = Path("/data/lxy/code/surgvu2025-category2-submission/model")
 
 RESOURCE_PATH = Path("resources")
 
@@ -280,7 +280,6 @@ def detect_tool_list(video_path):
 
     tools_list = extract_tools_list(
         video_path, det_model, id_label_dict, cls_model, cls_transform, device)
-    print("Detected tools:", tools_list)
 
     return tools_list
 
@@ -304,35 +303,6 @@ def merge_tools(video_description, tools_list, commercial2gt):
     - 如果 Qwen 有对应描述，就优先保留它的 commercial 名
     - 否则用 groundtruth 名
     """
-    def normalize_name(name):
-        return name.strip().lower()
-
-    # Step 1. 把检测模型输出 tools_list 映射到 groundtruth
-    gt_tools = set()
-    for tool in tools_list:
-        tool_norm = normalize_name(tool)
-        gt_name = commercial2gt.get(tool_norm, tool)
-        gt_tools.add(gt_name)
-
-    # Step 2. 遍历 Qwen 输出
-    desc_dict = {}
-    commercial_name_dict = {}
-    if "used_tools_and_function" in video_description:
-        for name, func in video_description["used_tools_and_function"].items():
-            name_norm = normalize_name(name)
-            gt_name = commercial2gt.get(name_norm, name)
-            if gt_name in gt_tools:  # 必须检测模型确认过
-                desc_dict[gt_name] = func
-                commercial_name_dict[gt_name] = name  # 保留 Qwen 原始 commercial 名
-
-    # Step 3. 合并
-    merged = {}
-    for gt_name in gt_tools:
-        key_name = commercial_name_dict.get(
-            gt_name, gt_name)  # 优先保留 Qwen commercial 名
-        merged[key_name] = desc_dict.get(gt_name, " ")
-
-    # Step 4. 为新的tools list添加function
     gt_tools_function_map = {
         "monopolar curved scissors": "Used for tissue cutting and dissection, providing monopolar electrosurgical energy for cutting and coagulation.",
         "force bipolar": "Used for tissue cutting and dissection, providing bipolar electrosurgical energy for cutting and coagulation.",
@@ -353,13 +323,50 @@ def merge_tools(video_description, tools_list, commercial2gt):
         "tenaculum forceps": "Used for firmly grasping and stabilizing tissue or organs.",
         "potts scissors": "Used for fine dissection and cutting of vessels or ducts."
     }
-    
-    for key, value in merged.items():
-        if value is None or value == " " or value == "":
-            if key in gt_tools_function_map:
-                merged[key] = gt_tools_function_map[key]
-            else:
-                merged[key] = " "
+
+    def normalize_name(name):
+        return name.strip().lower()
+
+    # Step 1. 把检测模型输出 tools_list 映射到 groundtruth
+    detect_tools = set()
+    for tool in tools_list:
+        tool_norm = normalize_name(tool)
+        gt_name = commercial2gt.get(tool_norm, tool)
+        detect_tools.add(gt_name)
+
+    # Step 2. 遍历 Qwen 输出
+    description_tools = {}
+    description_tools_gt = {}
+    description_tools_func = {}
+    if "used_tools_and_function" in video_description:
+        for idx, (name, func) in enumerate(video_description["used_tools_and_function"].items()):
+            description_tools[idx] = (name)
+            name_norm = normalize_name(name)
+            gt_name = commercial2gt.get(name_norm, name)
+            description_tools_gt[idx] = (gt_name)
+            description_tools_func[idx] = (func)
+
+    print("Description tools:", list(description_tools.values()))
+    print("Detected tools:", tools_list)
+
+    gt_tools = detect_tools.copy()
+    description_tools_gt_copy = description_tools_gt.copy()
+    for idx, gt_name in description_tools_gt_copy.items():
+        if gt_name not in detect_tools:
+            description_tools_gt.pop(idx)
+            description_tools.pop(idx)
+            description_tools_func.pop(idx)
+        elif gt_name in gt_tools:
+            gt_tools.remove(gt_name)
+
+    merged = {}
+    for idx, name in description_tools.items():
+        merged[name] = description_tools_func[idx]
+    for gt_name in gt_tools:
+        if gt_name in gt_tools_function_map:
+            merged[gt_name.capitalize()] = gt_tools_function_map[gt_name]
+        else:
+            merged[gt_name.capitalize()] = " "
 
     # 现在是 dict，可以安全更新
     video_description["used_tools_and_function"] = merged
@@ -384,6 +391,13 @@ def deepthink_infer_by_file(file_path, input_text):
     ]
 
     # 1. 分析question的语法结构
+    question = input_text.lower().split(" ")
+    definite_words = ["the", "this", "these", "that", "those", "such", "there"]
+    for word in definite_words:
+        if word in question:
+            question.remove(word)
+
+    question = " ".join(question)
     prompt = f"""You are a linguistic analyzer.  
             Your task is to analyze the grammatical structure of the given English sentence.
 
@@ -442,7 +456,7 @@ def deepthink_infer_by_file(file_path, input_text):
             }}
 
             Now analyze the following sentence:  
-            "{input_text}"
+            "{question}"
 
         """
     messages = []
@@ -505,7 +519,7 @@ def deepthink_infer_by_file(file_path, input_text):
 
         # 1.4 如果系动词是being, 则改为is
         if structure_json["linking_verb"] == "being":
-            structure_json["linking_verb"] = "is"
+            structure_json["linking_verb"] = "is being"
 
         # 1.5 将所有字符串中的"  "替换为" "
         for key, value in structure_json.items():
@@ -513,8 +527,26 @@ def deepthink_infer_by_file(file_path, input_text):
                 structure_json[key] = value.replace("  ", " ")
 
         print(structure_json)
-    except:
-        print(f"Error: {structure}")
+
+        # 1.6 删除表语中的主语
+        if structure_json["predicative"] is not None:
+            if structure_json["subject"] in structure_json["predicative"]:
+                structure_json["predicative"] = structure_json["predicative"].replace(
+                    structure_json["subject"], "")
+            # 删除表语头尾的空格
+            structure_json["predicative"] = structure_json["predicative"].strip()
+
+        # 1.7 原始问题里如果主语前面有the，但是结构分析里没有，那么把the在加回去
+        origin_head_the = input_text.lower().split(
+            " " + structure_json["subject"].lower())[0].split(" ")[-1] == "the"
+        structure_head_the = structure_json["subject"].lower(
+        ).startswith("the")
+        if structure_json["subject"] is not None:
+            if origin_head_the and not structure_head_the:
+                structure_json["subject"] = "the " + structure_json["subject"]
+
+    except Exception as e:
+        print(f"Error: {e}")
         structure_json = None
 
     # 1. get the description of the surgery
@@ -536,57 +568,105 @@ def deepthink_infer_by_file(file_path, input_text):
     description_json = json.loads(description)
     description_json["summary_describing"] = "endoscopic or laparoscopic surgery"
 
-    if ("monopolar curved scissors" in description_json["used_tools_and_function"].keys()):
-        description_json["used_tools_and_function"]["monopolar curved scissors"] = "tissue cut and dissection, while also providing monopolar electrosurgical energy for cutting and coagulation during minimally invasive procedures."
-
-    # 1.1 filter tools list by detect model
+    # 1.1 filter tools by detect model
     description_json = filter_tools(file_path, description_json)
 
-    # 2. get the actions of the surgery
-    action_list = ["dissection", "cut", "cut tissue", "hemostasis", "suture", "knotting",
-                   "resection", "specimen retrieval", "irrigation", "suction", "anastomosis"]
-    prompt = f"""
-        You are given a description of a laparoscopic (endoscopic) surgery scene.  
-    From the following action list: {action_list}, identify all the actions that are explicitly present in the description.  
+    if ("monopolar curved scissors" in list(map(str.lower, description_json["used_tools_and_function"].keys()))):
+        description_json["used_tools_and_function"]["monopolar curved scissors"] = "tissue cut and dissection, while also providing monopolar electrosurgical energy for cutting and coagulation during minimally invasive procedures."
+    if ("cadiere forceps" in list(map(str.lower, description_json["used_tools_and_function"].keys()))):
+        description_json["used_tools_and_function"]["cadiere forceps"] = "used to grasp, hold, and manipulate tissues or objects."
 
-    Surgery description: "{description}"  
-
-    Output only a Python list of the selected actions.  
-    Do not include any actions outside of {action_list}. 
-    
-    """
-    messages = []
-    messages.append({
-        "role": "user",
-        "content": [
-            {"type": "text", "text": prompt},
+    # 2. add actions and consumables
+    TOOL_ACTIONS_MAP = {
+        "scissors": [
+            "cut",
+            "cut tissue",
+            "dissect tissue",
+            "separate tissue planes",
+            "expose structures"
         ],
-    })
+        "needle": [
+            "grasp needle",
+            "position needle",
+            "drive needle",
+            "retrieve needle",
+            "suture tissue",
+            "suture",
+            "tie knots",
+            "knots",
+            "maintain tension"
+        ],
+        "cautery": [
+            "dissect tissue",
+            "coagulate tissue (monopolar energy)",
+            "separate tissue planes",
+            "expose anatomical structures",
+            "elevate tissue"
+        ],
+        "stapler": [
+            "staple tissue",
+            "transect tissue",
+            "seal vessels",
+            "create anastomosis",
+            "close tissue"
+        ],
+        "clip": [
+            "apply clips",
+            "occlude vessels",
+            "seal ducts",
+            "control bleeding",
+            "secure tissue structures"
+        ],
+        "bipolar": [
+            "grasp tissue",
+            "dissect tissue",
+            "coagulate tissue",
+            "control bleeding",
+            "maintain hemostasis"
+        ],
+        "vessel": [
+            "seal vessels",
+            "transect tissue",
+            "coagulate tissue",
+            "divide vessels",
+            "maintain hemostasis"
+        ],
+        "forceps": [
+            "grasp tissue",
+            "hold tissue",
+            "retract tissue",
+            "stabilize structures",
+            "assist suturing"
+        ]
+    }
 
-    actions = infer_by_message(messages, model)
+    actions_list = []
+    consumables_list = ["trocar"]
+    for tool in description_json.get("used_tools_and_function", {}).keys():
+        tool_lower = tool.lower()
+        for key, actions in TOOL_ACTIONS_MAP.items():
+            if key in tool_lower:
+                actions_list.extend(actions)
+        if "clip" in tool_lower:
+            consumables_list.append("clip")
+        if "needle" in tool_lower:
+            consumables_list.extend(["needle", "suture needle", "sutures"])
 
-    actions_list = [x.strip().strip("'")
-                    for x in actions.strip("[]").split(",")]
-    if 'suture' in actions_list and 'cut tissue' in actions_list:
-        actions_list.remove('cut tissue')
-    if 'suture' in actions_list and 'cut' in actions_list:
-        actions_list.remove('cut')
-
-    description_json["actions"] = actions_list
+    description_json["actions"] = list(set(actions_list))
+    description_json["consumables"] = list(set(consumables_list))
 
     print(description_json)
 
     # 3. answer the user's question
-    prompt = f"""
-        You are a precise question answering assistant. You are given a laparoscopic surgery(endoscopic surgery) video description.
+    prompt = f"""You are a precise question answering assistant. You are given a laparoscopic surgery(endoscopic surgery) video description.
     You are only allowed to answer based on the Video description to answer the user's question.Do NOT add any information not contained in the description.
     There should be logic before and after answering.
     Your task is to answer questions strictly following the predefined response style.
     
     Answering Rules:
-        1. instrument presence questions(used_tools_and_function contains the instrument in use):
-        - If a tool is explicitly listed in used_tools_and_function, answer with: "Yes, [instrument] are being used." / "Yes, a [instrument] was used."
-        - If a tool is not listed in used_tools_and_function, answer with: "No [instrument] are being used." / "No [instrument] is being used."
+        1. instrument presence questions:
+        - If instrument exists, answer with: "Yes, [instrument] are being used." / "Yes, a [instrument] was used."
+        - If instrument does not exist, answer with: "No [instrument] are being used." / "No [instrument] is being used."
 
         2. what type of [instrument class] is mentioned?
         - Answer with one short sentence starting with "The type of [instrument class] mentioned is [instrument]"
@@ -606,28 +686,28 @@ def deepthink_infer_by_file(file_path, input_text):
         6. Organ/tissue manipulation questions ("What organ is being manipulated?"):
         - Answer with one short sentence starting with: The organ being manipulated is the [organ]."
 
-        7. Procedure identification questions ("What procedure is this summary describing?"):
-        - Answer with one short sentence starting with "The summary is describing [refer to summary_describing, task_name and matched_description]."
-
-        8. Purpose/function questions ("What is the purpose of using [tool] in this procedure?"):
-        - Answer with one short sentence starting with: "The [tool] are used for [function]."
-   
-
     Video description:
     {description_json}
 
-    User question:
+    Now please answer the following question:
     {input_text}
-    Answer concisely, logically, and less than 10 words
+    
     """
-
     if structure_json is not None and structure_json["linking_verb"] is not None:
-        if structure_json["type"] == "normal":
+
+        is_question = False
+        for word in special_words + ['is', 'are', 'was', 'were', 'has', 'have', 'had', 'do', 'does', 'did', 'will',
+                                     'would', 'shall', 'should', 'can', 'could', 'may', 'might', 'must']:
+            if input_text.lower().startswith(word):
+                is_question = True
+                break
+
+        if structure_json["type"] == "normal" and is_question:
             structure_prompt = f"""
             if Yes: Yes, {structure_json["subject"]} {structure_json["linking_verb"]} {structure_json["predicative"]}
             if No: No, {structure_json["subject"]} {structure_json["linking_verb"]} not {structure_json["predicative"]}
             """
-        elif structure_json["type"] == "special":
+        elif structure_json["type"] == "special" and is_question:
             if "why" in input_text.lower().split(" "):
                 structure_prompt = f"""
                 because {structure_json["subject"]} [answer from description]
@@ -636,51 +716,18 @@ def deepthink_infer_by_file(file_path, input_text):
                 structure_prompt = f"""
                 {structure_json["subject"]} {structure_json["predicative"]} {structure_json["linking_verb"]} [answer from description]
                 """
-            prompt = f"""
-                You are a precise question answering assistant. You are given a laparoscopic surgery(endoscopic surgery) video description.
-            You are only allowed to answer based on the Video description to answer the user's question.Do NOT add any information not contained in the description.
-            There should be logic before and after answering.
-            Your task is to answer questions strictly following the predefined response style.
-            
-            Answering Rules:
-                1. instrument presence questions(used_tools_and_function contains the instrument in use):
-                - If a tool is explicitly listed in used_tools_and_function, answer with: "Yes, [instrument] are being used." / "Yes, a [instrument] was used."
-                - If a tool is not listed in used_tools_and_function, answer with: "No [instrument] are being used." / "No [instrument] is being used."
-
-                2. what type of [instrument class] is mentioned?
-                - Answer with one short sentence starting with "The type of [instrument class] mentioned is [instrument]"
-
-                3. used_tools_and_function list check questions ("Is a [instrument] among the listed tools?"):
-                - If listed: "Yes, a [instrument] is listed."
-                - If not listed: "No, a [instrument] is not listed."
-
-                4. actions list check questions ("Is a [action] required in this surgical step?"):
-                - Answer with yes/no + requirement: 
-                    e.g., "Yes, the procedure involves [action]." / "No, [action] are not required."
-                
-                5. Requirement questions ("Is a [task] required in this surgical step?"):
-                - Answer with yes/no + requirement: 
-                    e.g., "Yes, the procedure involves [action]." / "No, [task] are not required."
-
-                6. Organ/tissue manipulation questions ("What organ is being manipulated?"):
-                - Answer with one short sentence starting with: The organ being manipulated is the [organ]."
-
-                7. Procedure identification questions ("What procedure is this summary describing?"):
-                - Answer with one short sentence starting with "The summary is describing [procedure]."
-
-                8. Purpose/function questions ("What is the purpose of using [tool] in this procedure?"):
-                - Answer with one short sentence starting with: "The [tool] are used for [function]."
-        
-
-            Video description:
-            {description_json}
-
-            User question:
-            {input_text}
-
-            Please organize your answer in the following format:{structure_prompt}
-            Answer concisely, logically, and less than 10 words
+        else:
+            structure_prompt = f"""
+            {structure_json["subject"]} [answer from description]
             """
+        prompt += f"""
+        Answer in the following format, and less than 11 words:{structure_prompt}
+        """
+    else:
+        prompt += f"""
+        Answer concisely, logically, and less than 11 words
+        """
+
     messages = []
     messages.append({
         "role": "user",
@@ -690,29 +737,42 @@ def deepthink_infer_by_file(file_path, input_text):
     })
 
     response = infer_by_message(messages, model)
+    print(f"response: {response}")
 
     # 4. simplify the answer
     answer_word_num = len(response.split(" "))
-    if structure_json is not None and answer_word_num > 10:
+    if structure_json is not None and answer_word_num > 8:
 
         subject = structure_json["subject"] if structure_json["type"] == "normal" else structure_json["subject"] + \
             " " + structure_json["predicative"]
 
-        prompt_rebuild = f"""You are an assistant that simplifies answers.
-            Task:  
-            Please keep the subject "{subject}" and linking verb "{structure_json["linking_verb"]}" unchanged. 
-            Simplify the part of the sentence after the "{subject}", make sure the entire sentence is no more than 11 words.
-            
-            Examples:  
+        prompt_rebuild = f"""you are an assistant that simplifies sentence.
+        Task:
 
-            Input: "The purpose of using forceps in this procedure is to grasp tissue safely and securely."  
-            Output: "The purpose of using forceps is to grasp tissue safely."
+        Keep the subject "{subject}" and the linking verb "{structure_json["linking_verb"]}" unchanged.
 
-            Input: "Yes, a large needle driver is among the listed tools used here in surgery."  
-            Output: "Yes, a large needle driver is among the listed tools."
+        Simplify only the part after the linking verb by removing modifiers or adverbs that do not change the core meaning.
 
-            Now simplify the following answer, keeping the subject and linking verb unchanged:  
-            "{response}"
+        Ensure the entire sentence is no more than 11 words.
+
+        Do not change the sentence structure (remain subject + linking verb + complement).
+
+        Examples:
+
+        Input: "The purpose of using forceps in this procedure is to grasp tissue safely and securely."
+        Output: "The purpose of using forceps is to grasp tissue safely."
+
+        Input: "The cadiere forceps are used for grasping and manipulating tissue during endoscopic and laparoscopic surgery."
+        Output: "The cadiere forceps are used for grasping and manipulating tissue."
+
+        Input: "Yes, a large needle driver is among the listed tools used here in surgery."
+        Output: "Yes, a large needle driver is among the listed tools."
+
+        Input: "Because the cadiere forceps are used for grasping and manipulating tissue during dissection."
+        Output: "Because the cadiere forceps are used for grasping and manipulating tissue."
+
+        Now simplify the following sentence, keeping the subject and linking verb unchanged:
+        "{response}"
         """
 
         messages = []
@@ -723,6 +783,30 @@ def deepthink_infer_by_file(file_path, input_text):
             ],
         })
         response = infer_by_message(messages, model)
+        # 如果 response字符串两端有双引号，则去掉双引号
+        if response.startswith('"'):
+            response = response[1:]
+        if response.endswith('"'):
+            response = response[:-1]
+
+        # 只保留'.'或者';'之前的句子
+        if '.' in response:
+            response = response.split('.')[0]
+            response += '.'
+        if ';' in response:
+            response = response.split(';')[0]
+
+        response = response.lower()
+        if 'cadiere' in response and 'cadiere forceps' not in response:
+            response = response.replace('cadiere', 'cadiere forceps')
+        if 'bipolar' in response and 'bipolar forceps' not in response:
+            response = response.replace('bipolar', 'bipolar forceps')
+        if 'monopolar' in response and 'monopolar curved scissors' not in response:
+            response = response.replace(
+                'monopolar', 'monopolar curved scissors')
+
+        # response 首字母大写
+        response = response.capitalize()
 
     return response
 
