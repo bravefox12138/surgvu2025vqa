@@ -32,6 +32,7 @@ import configparser
 import logging
 from timm.models import create_model
 import torchvision.transforms as transforms
+import string
 
 # INPUT_PATH = Path("/input")
 # OUTPUT_PATH = Path("/output")
@@ -68,7 +69,7 @@ def load_model():
 
     global det_model, cls_model, cls_transform, device
     det_model_path = os.path.join(MODEL_PATH, "last.pt")
-    cls_model_path = os.path.join(MODEL_PATH, "checkpoint-best-ema_224.pth")
+    cls_model_path = os.path.join(MODEL_PATH, "checkpoint-399.pth")
     device = "cuda" if torch.cuda.is_available() else "cpu"
 
     # 初始化检测模型
@@ -382,7 +383,39 @@ def filter_tools(file_path, description_json):
     return description_json
 
 
+def longest_common_word_substring(s1, s2):
+    words1 = s1.split()
+    words2 = s2.split()
+    m = [[0] * (len(words2) + 1) for _ in range(len(words1) + 1)]
+    longest, end_index = 0, 0
+
+    for i in range(1, len(words1) + 1):
+        for j in range(1, len(words2) + 1):
+            if words1[i - 1] == words2[j - 1]:
+                m[i][j] = m[i - 1][j - 1] + 1
+                if m[i][j] > longest:
+                    longest = m[i][j]
+                    end_index = i
+            else:
+                m[i][j] = 0
+
+    # 拼接成字符串
+    return " ".join(words1[end_index - longest:end_index])
+
+
+def is_forceps_type_question(text: str) -> bool:
+    text = text.lower()
+    type_synonyms = ["type", "kind", "sort", "class", "category", "form"]
+    question_words = ["what", "which"]
+    return (
+        "forceps" in text
+        and any(word in text for word in type_synonyms)
+        and any(q in text.split() for q in question_words)  # 确保是真问题
+    )
+
+
 def deepthink_infer_by_file(file_path, input_text):
+    print(f"question: {input_text}")
     description_question = [
         "What is the used_tools_and_function? answer in json format",
         "What is the operated_organ_and_tissue? answer in json format",
@@ -390,122 +423,159 @@ def deepthink_infer_by_file(file_path, input_text):
         "Analyze the surgical procedure in the video and provide a structured JSON output with keys: used_tools_and_function, operated_organ_and_tissue, task_name, task_description, matched_description"
     ]
 
-    # 1. 分析question的语法结构
-    question = input_text.lower().split(" ")
-    definite_words = ["the", "this", "these", "that", "those", "such", "there"]
+    # 1. 去除定冠词
+    question = input_text.strip(string.punctuation).lower().split(" ")
+    definite_words = ["the", "this", "an",
+                      "a", "these", "that", "those", "such"]
+    definite_words_map = {}
     for word in definite_words:
         if word in question:
+            p = [i for i, x in enumerate(question) if x == word]
+            for i in p:
+                if i + 1 < len(question):
+                    definite_words_map[question[i + 1]
+                                       ] = word + " " + question[i + 1]
+    for word in definite_words + ['there']:
+        if word in question:
             question.remove(word)
-
     question = " ".join(question)
-    prompt = f"""You are a linguistic analyzer.  
-            Your task is to analyze the grammatical structure of the given English sentence.
 
-            Step 1: Determine the sentence structure: 
-            - If the sentence uses a linking verb (like is, are, was, were, seem, become) connecting the subject to a predicative, classify it as Subject–Linking Verb–Predicative (S-LV-P).
+    # 2. 分析一般疑问句和特殊疑问句：
+    special_words = ["what", "which", "who", "whom", "whose", "when", "where", "why", "how", "how many", "how much",
+                     "how long", "how often", "how far", "how big", "how small", "how heavy", "how light",
+                     "how tall", "how short", "how wide", "how deep", "how thick", "how thin", "how long",
+                     "how short", "how wide", "how deep", "how thick", "how thin"]
+    if input_text.lower().split(" ")[0] in special_words:
+        question_type = "special"
+    else:
+        question_type = "normal"
 
-            Step 2: Extract components according to the structure:
+    # 3. 分析问句的结构
+    structure_prompt = f"""You are a linguistic analyzer.  
+    Your task is to analyze the grammatical structure of the given English sentence.
 
-            - subject (主语)  
-            - linking_verb (系动词)  
-            - predicative / complement (表语)  
-            - adverbial (状语)  
-            - complement (补语)
+    Step 1: Determine the sentence structure: 
+    - If the sentence uses a linking verb (like is, are, was, were, seem, become) connecting the subject to a predicative, classify it as Subject–Linking Verb–Predicative (S-LV-P).
 
-            Rules:  
-            - If a component does not exist, set its value to null.  
-            - Output only valid JSON, nothing else.
+    Step 2: Extract components according to the structure:
 
-            Example 1:
-            Input: "Is a scissor among the tools?"  
-            Structure: S-LV-P  
-            Output:  
-            {{
-            "structure": "S-LV-P",
-            "subject": "a scissor",
-            "linking_verb": "is",
-            "predicative": "among the tools",
-            "adverbial": null,
-            "complement": null
-            }}
+    - subject
+    - linking_verb
+    - predicative
+    - adverbial
+    - complement
 
-            Example 2:
-            Input: "What object is being manipulated/used?"  
-            Structure: S-LV-P  
-            Output:  
-            {{
-            "structure": "S-LV-P",
-            "subject": "What object",
-            "linking_verb": "is",
-            "predicative": "being manipulated/used",
-            "adverbial": null,
-            "complement": null
-            }}
+    Special rule for **WH-questions** (what, which, who, where, etc.):
+    - If a WH-word starts the sentence, the noun or noun phrase immediately following it is usually the **subject**.
+    - Do not confuse auxiliary verbs (do, does, did) or main verbs with linking verbs in WH-questions.
 
-            Example 3:
-            Input: "What is the purpose of using scissor in this procedure?"  
-            Structure: S-LV-P  
-            Output:  
-            {{
-            "structure": "S-LV-P",
-            "subject": "the purpose of using scissor ",
-            "linking_verb": "is",
-            "predicative": "what",
-            "adverbial": "in this procedure",
-            "complement": null
-            }}
+    Rules:  
+    - If a component does not exist, set its value to null.  
+    - Output only valid JSON, nothing else.
 
-            Now analyze the following sentence:  
-            "{question}"
+    Example 1:
+    Input: "Is a scissor among the tools?"  
+    Structure: S-LV-P  
+    Output:  
+    {{
+    "structure": "S-LV-P",
+    "subject": "a scissor",
+    "linking_verb": "is",
+    "predicative": "among the tools",
+    "adverbial": null,
+    "complement": null
+    }}
 
-        """
+    Example 2:
+    Input: "Which structure is being cauterized during this surgery?"  
+    Structure: S-LV-P  
+    Output:  
+    {{
+    "structure": "S-LV-P",
+    "subject": "Which structure",
+    "linking_verb": "is",
+    "predicative": "being cauterized",
+    "adverbial": during this surgery,
+    "complement": null
+    }}
+
+    Example 3:
+    Input: "What object is being manipulated/used?"  
+    Structure: S-LV-P  
+    Output:  
+    {{
+    "structure": "S-LV-P",
+    "subject": "What object",
+    "linking_verb": "is",
+    "predicative": "being manipulated/used",
+    "adverbial": null,
+    "complement": null
+    }}
+
+    Example 4:
+    Input: "What is the purpose of using scissor in this procedure?"  
+    Structure: S-LV-P  
+    Output:  
+    {{
+    "structure": "S-LV-P",
+    "subject": "the purpose of using scissor ",
+    "linking_verb": "is",
+    "predicative": "what",
+    "adverbial": "in this procedure",
+    "complement": null
+    }}
+
+    Now analyze the following sentence:  
+    "{question}"
+    
+    """
     messages = []
     messages.append({
         "role": "user",
         "content": [
-            {"type": "text", "text": prompt},
+            {"type": "text", "text": structure_prompt},
         ],
     })
-
     structure = infer_by_message(messages, model)
 
+    # 4. 修改句子结构
     try:
-        structure_json = json.loads(structure)
-        # 1.1 去除特殊疑问词
-        special_words = ["what", "which", "who", "whom", "whose", "when", "where", "why", "how", "how many", "how much",
-                         "how long", "how often", "how far", "how big", "how small", "how heavy", "how light",
-                         "how tall", "how short", "how wide", "how deep", "how thick", "how thin", "how long",
-                         "how short", "how wide", "how deep", "how thick", "how thin"]
-        if input_text.lower().split(" ")[0] in special_words:
-            structure_json["type"] = "special"
-        else:
-            structure_json["type"] = "normal"
 
-        if structure_json["structure"] == "S-LV-P":
-            for key, value in structure_json.items():
-                if value is None:
+        # 去掉字符串两边的所有标点符号
+        structure = structure.strip("{}")
+        # 加上 {}
+        structure = "{" + structure + "}"
+        structure_json = json.loads(structure)
+        structure_json["type"] = question_type
+        print(f"response structure: {structure}")
+
+        # 4.1 将去除的定冠词重新加回去
+        for key, value in definite_words_map.items():
+            for structure in ["subject", "predicative", "adverbial", "complement"]:
+                if structure_json[structure] is None or structure_json[structure] == "":
                     continue
-                for word in special_words:
-                    if word in value.lower().split(" "):
-                        structure_json[key] = value.lower().replace(word, "")
-        # 1.2 去除表语中的状语
-        if structure_json["structure"] == "S-LV-P":
-            if structure_json['adverbial'] is not None and structure_json["predicative"] is not None:
-                if structure_json['adverbial'] in structure_json["predicative"]:
-                    structure_json["predicative"] = structure_json["predicative"].replace(
-                        structure_json['adverbial'], "")
-        # 1.3 特殊疑问句将主语上添加限定词
-        definite_words = ["the", "this", "an",
-                          "a", "these", "that", "those", "such"]
+                if key in structure_json[structure]:
+                    structure_json[structure] = structure_json[structure].replace(
+                        key, value)
+
+        print(f"relocate structure: {structure_json}")
+
+        # 4.2 去除特殊疑问词
+        for key, value in structure_json.items():
+            if value is None:
+                continue
+            for word in special_words:
+                if word in value.lower().split(" "):
+                    structure_json[key] = value.lower().replace(word, "the")
+
+        # 4.3 特殊疑问句将主语上添加限定词
         indefinite_words = ["some", "any", "all", "both",
                             "each", "every", "many", "much", "few"]
-
         if structure_json["subject"] is not None:
             for word in indefinite_words:
                 if word in structure_json["subject"].lower().split(" "):
                     structure_json["subject"] = structure_json["subject"].lower().replace(
                         word, "")
-
         if structure_json["type"] == "special":
             if structure_json["subject"] is not None:
                 has_definite_word = False
@@ -517,39 +587,33 @@ def deepthink_infer_by_file(file_path, input_text):
                     structure_json["subject"] = "The " + \
                         structure_json["subject"].lower()
 
-        # 1.4 如果系动词是being, 则改为is
+        # 4.4 如果系动词是being, 则改为is
         if structure_json["linking_verb"] == "being":
             structure_json["linking_verb"] = "is being"
 
-        # 1.5 将所有字符串中的"  "替换为" "
+        # 4.5 优化表语
+        if structure_json['adverbial'] is not None and structure_json["predicative"] is not None:
+            common = longest_common_word_substring(
+                structure_json["adverbial"], structure_json["predicative"])
+            structure_json["predicative"] = structure_json["predicative"].replace(
+                common, "").strip()
+        if structure_json['subject'] is not None and structure_json["predicative"] is not None:
+            common = longest_common_word_substring(
+                structure_json["subject"], structure_json["predicative"])
+            structure_json["predicative"] = structure_json["predicative"].replace(
+                common, "").strip()
+
+        # 4.6 将所有字符串中的"  "替换为" "
         for key, value in structure_json.items():
             if value is not None:
                 structure_json[key] = value.replace("  ", " ")
-
-        print(structure_json)
-
-        # 1.6 删除表语中的主语
-        if structure_json["predicative"] is not None:
-            if structure_json["subject"] in structure_json["predicative"]:
-                structure_json["predicative"] = structure_json["predicative"].replace(
-                    structure_json["subject"], "")
-            # 删除表语头尾的空格
-            structure_json["predicative"] = structure_json["predicative"].strip()
-
-        # 1.7 原始问题里如果主语前面有the，但是结构分析里没有，那么把the在加回去
-        origin_head_the = input_text.lower().split(
-            " " + structure_json["subject"].lower())[0].split(" ")[-1] == "the"
-        structure_head_the = structure_json["subject"].lower(
-        ).startswith("the")
-        if structure_json["subject"] is not None:
-            if origin_head_the and not structure_head_the:
-                structure_json["subject"] = "the " + structure_json["subject"]
+        print(f"final structure: {structure_json}")
 
     except Exception as e:
         print(f"Error: {e}")
         structure_json = None
 
-    # 1. get the description of the surgery
+    # 5. 获取手术视频描述
     messages = []
     messages.append({
         "role": "user",
@@ -566,17 +630,52 @@ def deepthink_infer_by_file(file_path, input_text):
 
     description = infer_by_message(messages, model)
     description_json = json.loads(description)
-    description_json["summary_describing"] = "endoscopic or laparoscopic surgery"
+    description_json["summary_describing"] = "This is a description of endoscopic or laparoscopic surgery."
 
-    # 1.1 filter tools by detect model
+    # 5.1 利用检测模型过滤器械列表
     description_json = filter_tools(file_path, description_json)
+    description_json["used_tools_and_function"] = {k.lower(): v for k,
+                                                   v in description_json["used_tools_and_function"].items()}
 
-    if ("monopolar curved scissors" in list(map(str.lower, description_json["used_tools_and_function"].keys()))):
-        description_json["used_tools_and_function"]["monopolar curved scissors"] = "tissue cut and dissection, while also providing monopolar electrosurgical energy for cutting and coagulation during minimally invasive procedures."
-    if ("cadiere forceps" in list(map(str.lower, description_json["used_tools_and_function"].keys()))):
-        description_json["used_tools_and_function"]["cadiere forceps"] = "used to grasp, hold, and manipulate tissues or objects."
+    # 5.2 修正器械功能描述
+    for key, value in description_json["used_tools_and_function"].items():
+        if "monopolar curved scissors" in key:
+            description_json["used_tools_and_function"][key] = "used to cut and coagulate tissues."
+        if "cadiere forceps" in key:
+            description_json["used_tools_and_function"][key] = "this is one kind of forceps, used to grasp and hold tissues or objects."
+        if "bipolar forceps" in key:
+            description_json["used_tools_and_function"][key] = "this is one kind of forceps, used to grasp and coagulate tissues."
+        if "bipolar grasper" in key or "force bipolar" in key:
+            description_json["used_tools_and_function"][key] = "used to grasp and coagulate tissues."
+        if "suturecut needle driver" in key:
+            description_json["used_tools_and_function"][key] = "used to grasp needles and cut sutures."
+        elif "needle driver" in key:
+            description_json["used_tools_and_function"][key] = "used to grasp needles."
+        if "clip applicator" in key:
+            description_json["used_tools_and_function"][key] = "used to apply clips to vessels or ducts for hemostasis or closure."
+        if "cautery" in key:
+            description_json["used_tools_and_function"][key] = "used to cut and coagulate tissues."
+        if "suction irrigator" in key:
+            description_json["used_tools_and_function"][key] = "used to aspirate fluids and irrigate tissues"
+        if "synchroseal" in key:
+            description_json["used_tools_and_function"][key] = "used to seal vessels and tissues while cutting."
+        if "stapler" in key:
+            description_json["used_tools_and_function"][key] = "used to transect tissues and apply staples for closure."
+        if "retractor" in key:
+            description_json["used_tools_and_function"][key] = "used to grasp and retract tissues."
+        if "prograsp forceps" in key:
+            description_json["used_tools_and_function"][key] = "this is one kind of forceps, used to strongly grasp and retract tissues."
 
-    # 2. add actions and consumables
+    # 5.3 修正操作器官和组织列表
+    description_json["operated_organ_and_tissue"] = [
+        v.lower() for v in description_json["operated_organ_and_tissue"]]
+    for i in range(len(description_json["operated_organ_and_tissue"])):
+        if "uterine horn" in description_json["operated_organ_and_tissue"][i] and "connective tissue" in description_json["operated_organ_and_tissue"][i]:
+            description_json["operated_organ_and_tissue"][i] = "uterine horn"
+    description_json["operated_organ_and_tissue"] = list(
+        set(description_json["operated_organ_and_tissue"]))
+
+    # 5.4 添加附加信息
     TOOL_ACTIONS_MAP = {
         "scissors": [
             "cut",
@@ -655,10 +754,76 @@ def deepthink_infer_by_file(file_path, input_text):
     description_json["actions"] = list(set(actions_list))
     description_json["consumables"] = list(set(consumables_list))
 
+    # 5.5 删除task_description和matched_description（可能造成幻觉）
+    if "task_description" in description_json:
+        description_json.pop("task_description")
+    if "matched_description" in description_json:
+        description_json.pop("matched_description")
     print(description_json)
 
+    # # 6 回答用户问题
+    # prompt = f"""You are a precise question answering assistant. You are given a laparoscopic surgery(endoscopic surgery) video description.
+    # You are only allowed to answer based on the Video description to answer the user's question.Do NOT add any information not contained in the description.
+    # There should be logic before and after answering.
+    # Your task is to answer questions strictly following the predefined response style.
+
+    # Answering Rules:
+    #     1. instrument presence questions:
+    #     - If instrument exists, answer with: "Yes, [instrument] are being used." / "Yes, a [instrument] was used."
+    #     - If instrument does not exist, answer with: "No [instrument] are being used." / "No [instrument] is being used."
+
+    #     2. what type of [instrument class] is mentioned?
+    #     - Answer with one short sentence starting with "The type of [instrument class] mentioned is [instrument]"
+
+    #     3. used_tools_and_function list check questions ("Is a [instrument] among the listed tools?"):
+    #     - If listed: "Yes, a [instrument] is listed."
+    #     - If not listed: "No, a [instrument] is not listed."
+
+    #     4. actions list check questions ("Is a [action] required in this surgical step?"):
+    #     - Answer with yes/no + requirement:
+    #         e.g., "Yes, the procedure involves [action]." / "No, [action] are not required."
+
+    #     5. Requirement questions ("Is a [task] required in this surgical step?"):
+    #     - Answer with yes/no + requirement:
+    #         e.g., "Yes, the procedure involves [action]." / "No, [task] are not required."
+
+    #     6. Purpose/function questions ("What is the purpose of using forceps in this procedure?"):
+    #     - Answer with: "The purpose of [tool] is to [function]."
+
+    #     7. Organ/tissue manipulation questions ("What organ is being manipulated?"):
+    #     - Answer with one short sentence starting with: The organ being manipulated is the [organ]."
+
+    # Video description:
+    # {description_json}
+
+    # Now please answer the following question:
+    # {input_text}
+
+    # """
+
+    ###########################################
+    import pandas as pd
+    df_tool = pd.read_csv(os.path.join(
+        MODEL_PATH, "toolname_mapping_filter.csv"))
+    mapping = {row["commercial_toolname"].lower(): row["groundtruth_toolname"]
+               for _, row in df_tool.iterrows()}
+
+    # 2. 构建新的 used_tools_and_function
+    new_used_tools_and_function = {}
+    for tool, func in description_json["used_tools_and_function"].items():
+        tool_lower = tool.lower()
+        if tool_lower in mapping:
+            new_tool = mapping[tool_lower]
+        else:
+            new_tool = tool  # 如果没找到就保留原名
+        new_used_tools_and_function[new_tool] = func
+
+    # 3. 新建一个新的 description_json_gtool
+    description_json_gtool = description_json.copy()
+    description_json_gtool["used_tools_and_function"] = new_used_tools_and_function
+
     # 3. answer the user's question
-    prompt = f"""You are a precise question answering assistant. You are given a laparoscopic surgery(endoscopic surgery) video description.
+    prompt_normal = f"""You are a precise question answering assistant. You are given a laparoscopic surgery(endoscopic surgery) video description.
     You are only allowed to answer based on the Video description to answer the user's question.Do NOT add any information not contained in the description.
     There should be logic before and after answering.
     Your task is to answer questions strictly following the predefined response style.
@@ -691,30 +856,95 @@ def deepthink_infer_by_file(file_path, input_text):
 
     Now please answer the following question:
     {input_text}
-    
     """
-    if structure_json is not None and structure_json["linking_verb"] is not None:
+    prompt_forceps = f"""You are a precise question answering assistant. You are given a laparoscopic surgery(endoscopic surgery) video description.
+    You are only allowed to answer based on the Video description to answer the user's question.Do NOT add any information not contained in the description.
+    There should be logic before and after answering.
+    Your task is to answer questions strictly following the predefined response style.
+    
+    Answering Rules:
+        1. instrument presence questions:
+        - If instrument exists, answer with: "Yes, [instrument] are being used." / "Yes, a [instrument] was used."
+        - If instrument does not exist, answer with: "No [instrument] are being used." / "No [instrument] is being used."
 
+        2. what type of [instrument class] is mentioned?
+        - Answer with one short sentence starting with "The type of [instrument class] mentioned is [instrument]"
+
+        3. used_tools_and_function list check questions ("Is a [instrument] among the listed tools?"):
+        - If listed: "Yes, a [instrument] is listed."
+        - If not listed: "No, a [instrument] is not listed."
+
+        4. actions list check questions ("Is a [action] required in this surgical step?"):
+        - Answer with yes/no + requirement: 
+            e.g., "Yes, the procedure involves [action]." / "No, [action] are not required."
+        
+        5. Requirement questions ("Is a [task] required in this surgical step?"):
+        - Answer with yes/no + requirement: 
+            e.g., "Yes, the procedure involves [action]." / "No, [task] are not required."
+
+        6. Organ/tissue manipulation questions ("What organ is being manipulated?"):
+        - Answer with one short sentence starting with: The organ being manipulated is the [organ]."
+
+    Video description:
+    {description_json_gtool}
+
+    Now please answer the following question:
+    {input_text}
+    """
+
+    if (is_forceps_type_question(input_text)):
+        prompt = prompt_forceps
+    else:
+        prompt = prompt_normal
+
+    ##########################################
+
+    linking_verbs = ['is', 'are', 'was', 'were', 'has', 'have', 'had',  'will', 'would', 'shall', 'should',
+                     'can', 'could', 'may', 'might', 'must']
+    if structure_json is not None and structure_json["linking_verb"] is not None and structure_json["subject"] is not None and structure_json["predicative"] is not None:
         is_question = False
-        for word in special_words + ['is', 'are', 'was', 'were', 'has', 'have', 'had', 'do', 'does', 'did', 'will',
-                                     'would', 'shall', 'should', 'can', 'could', 'may', 'might', 'must']:
+        for word in special_words + linking_verbs + ["do", "does", "did"]:
             if input_text.lower().startswith(word):
                 is_question = True
                 break
 
         if structure_json["type"] == "normal" and is_question:
-            structure_prompt = f"""
-            if Yes: Yes, {structure_json["subject"]} {structure_json["linking_verb"]} {structure_json["predicative"]}
-            if No: No, {structure_json["subject"]} {structure_json["linking_verb"]} not {structure_json["predicative"]}
-            """
+            if any(w in structure_json["linking_verb"].lower() for w in linking_verbs):
+                structure_prompt = f"""
+                if Yes: Yes, {structure_json["subject"]} {structure_json["linking_verb"]} {structure_json["predicative"]}
+                if No: No, {structure_json["subject"]} {structure_json["linking_verb"]} not {structure_json["predicative"]}
+                """
+            else:
+                structure_prompt = f"""
+                if Yes: Yes, {structure_json["subject"]} [answer from description]
+                if No: No, {structure_json["subject"]} [answer from description]
+                """
         elif structure_json["type"] == "special" and is_question:
+            if structure_json["subject"] == "the" or structure_json["subject"] == "":
+                structure_json["subject"] = structure_json["subject"] + \
+                    " " + structure_json["predicative"]
+                structure_json["predicative"] = ""
             if "why" in input_text.lower().split(" "):
                 structure_prompt = f"""
                 because {structure_json["subject"]} [answer from description]
                 """
+            elif any(a in structure_json["linking_verb"].lower() for a in linking_verbs):
+                w = structure_json["predicative"].split(" ")[0]
+                if w.endswith("ed"):
+                    structure_prompt = f"""
+                    {structure_json["subject"]} {w} {structure_json["linking_verb"]} [answer from description]
+                    """
+                elif structure_json["predicative"].startswith("of") or structure_json["predicative"].startswith("being"):
+                    structure_prompt = f"""
+                    {structure_json["subject"]} {structure_json["predicative"]} {structure_json["linking_verb"]} [answer from description]
+                    """
+                else:
+                    structure_prompt = f"""
+                    {structure_json["subject"]} {structure_json["linking_verb"]} [answer from description]
+                    """
             else:
                 structure_prompt = f"""
-                {structure_json["subject"]} {structure_json["predicative"]} {structure_json["linking_verb"]} [answer from description]
+                {structure_json["subject"]} [answer from description]
                 """
         else:
             structure_prompt = f"""
@@ -722,10 +952,12 @@ def deepthink_infer_by_file(file_path, input_text):
             """
         prompt += f"""
         Answer in the following format, and less than 11 words:{structure_prompt}
+        Ensure the answer is grammatically correct. 
         """
     else:
         prompt += f"""
         Answer concisely, logically, and less than 11 words
+        Ensure the answer is grammatically correct.  
         """
 
     messages = []
@@ -737,9 +969,10 @@ def deepthink_infer_by_file(file_path, input_text):
     })
 
     response = infer_by_message(messages, model)
-    print(f"response: {response}")
 
-    # 4. simplify the answer
+    print(f"response answer: {response}")
+
+    # 7 简化答案
     answer_word_num = len(response.split(" "))
     if structure_json is not None and answer_word_num > 8:
 
@@ -751,28 +984,34 @@ def deepthink_infer_by_file(file_path, input_text):
 
         Keep the subject "{subject}" and the linking verb "{structure_json["linking_verb"]}" unchanged.
 
-        Simplify only the part after the linking verb by removing modifiers or adverbs that do not change the core meaning.
-
         Ensure the entire sentence is no more than 11 words.
 
         Do not change the sentence structure (remain subject + linking verb + complement).
 
         Examples:
-
         Input: "The purpose of using forceps in this procedure is to grasp tissue safely and securely."
-        Output: "The purpose of using forceps is to grasp tissue safely."
+        Output: "The purpose of forceps is to grasp tissue."
 
         Input: "The cadiere forceps are used for grasping and manipulating tissue during endoscopic and laparoscopic surgery."
         Output: "The cadiere forceps are used for grasping and manipulating tissue."
 
         Input: "Yes, a large needle driver is among the listed tools used here in surgery."
-        Output: "Yes, a large needle driver is among the listed tools."
+        Output: "Yes, a large needle driver is listed."
 
-        Input: "Because the cadiere forceps are used for grasping and manipulating tissue during dissection."
-        Output: "Because the cadiere forceps are used for grasping and manipulating tissue."
+        Input: "The type of forceps mentioned is maryland bipolar forceps in this surgery."
+        Output: "The type of forceps mentioned is maryland bipolar forceps."
+
+        Input: "Because the cadiere forceps are used during dissection."
+        Output: "Because the cadiere forceps are used."
+
+        Input: "The maryland bipolar forceps are used to grasp and coagulate tissues during vessel isolation."
+        Output: "The maryland bipolar forceps are used to grasp and coagulate tissues."
 
         Now simplify the following sentence, keeping the subject and linking verb unchanged:
         "{response}"
+
+        Do not simplify the instrument name: {[key for key in description_json["used_tools_and_function"].keys()]}.
+
         """
 
         messages = []
@@ -783,33 +1022,69 @@ def deepthink_infer_by_file(file_path, input_text):
             ],
         })
         response = infer_by_message(messages, model)
-        # 如果 response字符串两端有双引号，则去掉双引号
-        if response.startswith('"'):
-            response = response[1:]
-        if response.endswith('"'):
-            response = response[:-1]
+        print(f"answer simplify: {response}")
 
-        # 只保留'.'或者';'之前的句子
-        if '.' in response:
-            response = response.split('.')[0]
-            response += '.'
-        if ';' in response:
-            response = response.split(';')[0]
+    # 去掉response两端的双引号
+    response = response.strip('""')
+    response = response.lower()
+    response = response.strip('.')
 
-        response = response.lower()
-        if 'cadiere' in response and 'cadiere forceps' not in response:
-            response = response.replace('cadiere', 'cadiere forceps')
-        if 'bipolar' in response and 'bipolar forceps' not in response:
-            response = response.replace('bipolar', 'bipolar forceps')
-        if 'monopolar' in response and 'monopolar curved scissors' not in response:
-            response = response.replace(
-                'monopolar', 'monopolar curved scissors')
+    # 只保留'.'或者';'之前的句子
+    if '.' in response:
+        response = response.split('.')[0]
+    if ';' in response:
+        response = response.split(';')[0]
 
-        # response 首字母大写
-        response = response.capitalize()
+    # 截断过长语段
+    split_response = response.split(", ")
+    response_list = split_response[:2] if len(
+        split_response) > 2 else split_response
+    if len(response_list[-1].split(" ")) < 3:
+        response = " and ".join(response_list)
+    else:
+        response = ", ".join(response_list)
+
+    # 词语替换
+    if "of using" in response:
+        response = response.replace("of using", "of")
+    if "is rectal artery/vein" in response:
+        response = response.replace(
+            "is rectal artery/vein", "are rectal artery and rectal vein")
+
+    # 去除多余的during
+    if len(response.split(" during")[-1].split(" ")) < 4:
+        response = " ".join(response.split("during")[:-1])
+    if len(response.split(" during")[0].split(" ")) >= 8:
+        response = response.split(" during")[0]
+
+    question = input_text.strip(string.punctuation).lower().split(" ")
+
+    # 修正特殊词汇
+    definite_words = ["being"]
+    definite_words_map = {}
+    for word in definite_words:
+        if word in question:
+            p = [i for i, x in enumerate(question) if x == word]
+            for i in p:
+                if i + 1 < len(question):
+                    definite_words_map[question[i +
+                                                1].strip(string.punctuation)] = word
+    response_word_list = response.split(" ")
+    for key, value in definite_words_map.items():
+        if key.strip(string.punctuation) in response_word_list:
+            index = response_word_list.index(key)
+            if index - 1 >= 0:
+                if response_word_list[index - 1] != value:
+                    response_word_list.insert(index-1, value)
+                    response = response.replace(key, value + " " + key)
+
+    # response 首字母大写
+    response = response.strip()
+    response += '.'
+    response = response.capitalize()
+    print(f"answer: {response}")
 
     return response
-
 
 def infer(file_path, input_text):
     description_question = [
