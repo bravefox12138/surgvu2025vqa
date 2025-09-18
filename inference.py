@@ -34,15 +34,15 @@ from timm.models import create_model
 import torchvision.transforms as transforms
 import string
 
-# INPUT_PATH = Path("/input")
-# OUTPUT_PATH = Path("/output")
-# MODEL_PATH = Path("/opt/app/model")
+INPUT_PATH = Path("/input")
+OUTPUT_PATH = Path("/output")
+MODEL_PATH = Path("/opt/app/model")
 
-INPUT_PATH = Path(
-    "/data/lxy/code/surgvu2025-category2-submission/test/input")
-OUTPUT_PATH = Path(
-    "/data/lxy/code/surgvu2025-category2-submission/test/output")
-MODEL_PATH = Path("/data/lxy/code/surgvu2025-category2-submission/model")
+# INPUT_PATH = Path(
+#     "/data/lxy/code/surgvu2025-category2-submission/test/input")
+# OUTPUT_PATH = Path(
+#     "/data/lxy/code/surgvu2025-category2-submission/test/output")
+# MODEL_PATH = Path("/data/lxy/code/surgvu2025-category2-submission/model")
 
 RESOURCE_PATH = Path("resources")
 
@@ -435,7 +435,7 @@ def deepthink_infer_by_file(file_path, input_text):
                 if i + 1 < len(question):
                     definite_words_map[question[i + 1]
                                        ] = word + " " + question[i + 1]
-    for word in definite_words + ['there']:
+    for word in definite_words + ['there','being']:
         if word in question:
             question.remove(word)
     question = " ".join(question)
@@ -487,6 +487,19 @@ def deepthink_infer_by_file(file_path, input_text):
     }}
 
     Example 2:
+    Input: "Is a needle driver being used in this procedure?"  
+    Structure: S-LV-P  
+    Output:  
+    {{
+    "structure": "S-LV-P",
+    "subject": "a needle driver",
+    "linking_verb": "is",
+    "predicative": "being used",
+    "adverbial": "in this procedure",
+    "complement": null
+    }}
+
+    Example 3:
     Input: "Which structure is being cauterized during this surgery?"  
     Structure: S-LV-P  
     Output:  
@@ -499,7 +512,7 @@ def deepthink_infer_by_file(file_path, input_text):
     "complement": null
     }}
 
-    Example 3:
+    Example 4:
     Input: "What object is being manipulated/used?"  
     Structure: S-LV-P  
     Output:  
@@ -512,7 +525,7 @@ def deepthink_infer_by_file(file_path, input_text):
     "complement": null
     }}
 
-    Example 4:
+    Example 5:
     Input: "What is the purpose of using scissor in this procedure?"  
     Structure: S-LV-P  
     Output:  
@@ -822,9 +835,13 @@ def deepthink_infer_by_file(file_path, input_text):
     description_json_gtool = description_json.copy()
     description_json_gtool["used_tools_and_function"] = new_used_tools_and_function
 
+    tool_list_gt = list(
+        description_json_gtool['used_tools_and_function'].keys())
+    tool_list = list(description_json['used_tools_and_function'].keys())
+
     # 3. answer the user's question
     prompt_normal = f"""You are a precise question answering assistant. You are given a laparoscopic surgery(endoscopic surgery) video description.
-    You are only allowed to answer based on the Video description to answer the user's question.Do NOT add any information not contained in the description.
+    You are only allowed to answer based on the Video description and Tool List to answer the user's question.Do NOT add any information not contained in the description.
     There should be logic before and after answering.
     Your task is to answer questions strictly following the predefined response style.
     
@@ -853,12 +870,15 @@ def deepthink_infer_by_file(file_path, input_text):
 
     Video description:
     {description_json}
+    
+    Tool List:
+    {tool_list}
 
     Now please answer the following question:
     {input_text}
     """
     prompt_forceps = f"""You are a precise question answering assistant. You are given a laparoscopic surgery(endoscopic surgery) video description.
-    You are only allowed to answer based on the Video description to answer the user's question.Do NOT add any information not contained in the description.
+    You are only allowed to answer based on the Video description and Tool List to answer the user's question.Do NOT add any information not contained in the description.
     There should be logic before and after answering.
     Your task is to answer questions strictly following the predefined response style.
     
@@ -887,6 +907,9 @@ def deepthink_infer_by_file(file_path, input_text):
 
     Video description:
     {description_json_gtool}
+    
+    Tool List:
+    {tool_list_gt}
 
     Now please answer the following question:
     {input_text}
@@ -901,6 +924,7 @@ def deepthink_infer_by_file(file_path, input_text):
 
     linking_verbs = ['is', 'are', 'was', 'were', 'has', 'have', 'had',  'will', 'would', 'shall', 'should',
                      'can', 'could', 'may', 'might', 'must']
+    answer_p = "[answer from Video description]"
     if structure_json is not None and structure_json["linking_verb"] is not None and structure_json["subject"] is not None and structure_json["predicative"] is not None:
         is_question = False
         for word in special_words + linking_verbs + ["do", "does", "did"]:
@@ -911,13 +935,13 @@ def deepthink_infer_by_file(file_path, input_text):
         if structure_json["type"] == "normal" and is_question:
             if any(w in structure_json["linking_verb"].lower() for w in linking_verbs):
                 structure_prompt = f"""
-                if Yes: Yes, {structure_json["subject"]} {structure_json["linking_verb"]} {structure_json["predicative"]}
-                if No: No, {structure_json["subject"]} {structure_json["linking_verb"]} not {structure_json["predicative"]}
+                If the answer is Yes, reply: Yes, {structure_json["subject"]} {structure_json["linking_verb"]} {structure_json["predicative"]}
+                If the answer is No, reply: No, {structure_json["subject"]} {structure_json["linking_verb"]} not {structure_json["predicative"]}
                 """
             else:
                 structure_prompt = f"""
-                if Yes: Yes, {structure_json["subject"]} [answer from description]
-                if No: No, {structure_json["subject"]} [answer from description]
+                If the answer is Yes, reply: Yes, {structure_json["subject"]} {answer_p}
+                If the answer is No, reply: No, {structure_json["subject"]} {answer_p}
                 """
         elif structure_json["type"] == "special" and is_question:
             if structure_json["subject"] == "the" or structure_json["subject"] == "":
@@ -926,29 +950,29 @@ def deepthink_infer_by_file(file_path, input_text):
                 structure_json["predicative"] = ""
             if "why" in input_text.lower().split(" "):
                 structure_prompt = f"""
-                because {structure_json["subject"]} [answer from description]
+                because {structure_json["subject"]} {answer_p}
                 """
             elif any(a in structure_json["linking_verb"].lower() for a in linking_verbs):
                 w = structure_json["predicative"].split(" ")[0]
                 if w.endswith("ed"):
                     structure_prompt = f"""
-                    {structure_json["subject"]} {w} {structure_json["linking_verb"]} [answer from description]
+                    {structure_json["subject"]} {w} {structure_json["linking_verb"]} {answer_p}
                     """
                 elif structure_json["predicative"].startswith("of") or structure_json["predicative"].startswith("being"):
                     structure_prompt = f"""
-                    {structure_json["subject"]} {structure_json["predicative"]} {structure_json["linking_verb"]} [answer from description]
+                    {structure_json["subject"]} {structure_json["predicative"]} {structure_json["linking_verb"]} {answer_p}
                     """
                 else:
                     structure_prompt = f"""
-                    {structure_json["subject"]} {structure_json["linking_verb"]} [answer from description]
+                    {structure_json["subject"]} {structure_json["linking_verb"]} {answer_p}
                     """
             else:
                 structure_prompt = f"""
-                {structure_json["subject"]} [answer from description]
+                {structure_json["subject"]} {answer_p}
                 """
         else:
             structure_prompt = f"""
-            {structure_json["subject"]} [answer from description]
+            {structure_json["subject"]} {answer_p}
             """
         prompt += f"""
         Answer in the following format, and less than 11 words:{structure_prompt}
