@@ -369,6 +369,11 @@ def merge_tools(video_description, tools_list, commercial2gt):
         else:
             merged[gt_name.capitalize()] = " "
 
+    tool_list = [tool.lower() for tool in description_tools.values()]
+    gt_tools_list = [tool.lower() for tool in detect_tools]
+    if "cadiere forceps" in tool_list and "needle driver" in gt_tools_list:
+        merged["cadiere forceps"] = "this is one kind of forceps, used to grasp and hold tissues or objects."
+
     # 现在是 dict，可以安全更新
     video_description["used_tools_and_function"] = merged
     return video_description
@@ -435,7 +440,7 @@ def deepthink_infer_by_file(file_path, input_text):
                 if i + 1 < len(question):
                     definite_words_map[question[i + 1]
                                        ] = word + " " + question[i + 1]
-    for word in definite_words + ['there','being']:
+    for word in definite_words + ['there', 'being']:
         if word in question:
             question.remove(word)
     question = " ".join(question)
@@ -626,6 +631,9 @@ def deepthink_infer_by_file(file_path, input_text):
         print(f"Error: {e}")
         structure_json = None
 
+    if question.startswith("how many"):
+        structure_json = None
+
     # 5. 获取手术视频描述
     messages = []
     messages.append({
@@ -768,10 +776,10 @@ def deepthink_infer_by_file(file_path, input_text):
     description_json["consumables"] = list(set(consumables_list))
 
     # 5.5 删除task_description和matched_description（可能造成幻觉）
-    if "task_description" in description_json:
-        description_json.pop("task_description")
-    if "matched_description" in description_json:
-        description_json.pop("matched_description")
+    # if "task_description" in description_json:
+    #     description_json.pop("task_description")
+    # if "matched_description" in description_json:
+    #     description_json.pop("matched_description")
     print(description_json)
 
     # # 6 回答用户问题
@@ -905,6 +913,7 @@ def deepthink_infer_by_file(file_path, input_text):
         6. Organ/tissue manipulation questions ("What organ is being manipulated?"):
         - Answer with one short sentence starting with: The organ being manipulated is the [organ]."
 
+
     Video description:
     {description_json_gtool}
     
@@ -924,7 +933,7 @@ def deepthink_infer_by_file(file_path, input_text):
 
     linking_verbs = ['is', 'are', 'was', 'were', 'has', 'have', 'had',  'will', 'would', 'shall', 'should',
                      'can', 'could', 'may', 'might', 'must']
-    answer_p = "[answer from Video description]"
+    answer_p = "[concise answer the question]"
     if structure_json is not None and structure_json["linking_verb"] is not None and structure_json["subject"] is not None and structure_json["predicative"] is not None:
         is_question = False
         for word in special_words + linking_verbs + ["do", "does", "did"]:
@@ -998,16 +1007,25 @@ def deepthink_infer_by_file(file_path, input_text):
 
     # 7 简化答案
     answer_word_num = len(response.split(" "))
+    
     if structure_json is not None and answer_word_num > 8:
-
-        subject = structure_json["subject"] if structure_json["type"] == "normal" else structure_json["subject"] + \
-            " " + structure_json["predicative"]
-
+        if structure_json["subject"] is not None and structure_json["predicative"] is not None:
+            w = structure_json["predicative"].split(" ")[0]
+            if w.endswith("ed"):
+                subject = f"""{structure_json["subject"]} {w}"""
+            elif structure_json["predicative"].startswith("of") or structure_json["predicative"].startswith("being"):
+                subject = f"""{structure_json["subject"]} {structure_json["predicative"]}"""
+            else:
+                subject = structure_json["subject"]
+            task = f"""Keep the subject "{subject}" unchanged."""
+        else:
+            task = f"""Keep the subject unchanged."""
+        
         prompt_rebuild = f"""you are an assistant that simplifies sentence.
         Task:
-
-        Keep the subject "{subject}" and the linking verb "{structure_json["linking_verb"]}" unchanged.
-
+        
+        {task}
+        
         Ensure the entire sentence is no more than 11 words.
 
         Do not change the sentence structure (remain subject + linking verb + complement).
