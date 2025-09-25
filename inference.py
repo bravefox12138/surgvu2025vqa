@@ -55,8 +55,6 @@ def log_cuda_memory(message):
     print("Allocated:", torch.cuda.memory_allocated(device="cuda:0")/1024**2, "MB")
     print("Reserved :", torch.cuda.memory_reserved(device="cuda:0")/1024**2, "MB")
     print("Max Allocated:", torch.cuda.max_memory_allocated(device="cuda:0")/1024**2, "MB")
-
-    # 打印 GPU 显存使用情况
     os.system("nvidia-smi")
 
 
@@ -428,7 +426,6 @@ def deepthink_infer_by_file(file_path, input_text):
         "Analyze the surgical procedure in the video and provide a structured JSON output with keys: used_tools_and_function, operated_organ_and_tissue, task_name, task_description, matched_description"
     ]
 
-    # 1. 去除定冠词
     question = input_text.strip(string.punctuation).lower().split(" ")
     definite_words = ["the", "this", "an",
                       "a", "these", "that", "those", "such"]
@@ -445,7 +442,6 @@ def deepthink_infer_by_file(file_path, input_text):
             question.remove(word)
     question = " ".join(question)
 
-    # 2. 分析一般疑问句和特殊疑问句：
     special_words = ["what", "which", "who", "whom", "whose", "when", "where", "why", "how", "how many", "how much",
                      "how long", "how often", "how far", "how big", "how small", "how heavy", "how light",
                      "how tall", "how short", "how wide", "how deep", "how thick", "how thin", "how long",
@@ -455,7 +451,6 @@ def deepthink_infer_by_file(file_path, input_text):
     else:
         question_type = "normal"
 
-    # 3. 分析问句的结构
     structure_prompt = f"""You are a linguistic analyzer.  
     Your task is to analyze the grammatical structure of the given English sentence.
 
@@ -556,18 +551,13 @@ def deepthink_infer_by_file(file_path, input_text):
     })
     structure = infer_by_message(messages, model)
 
-    # 4. 修改句子结构
     try:
 
-        # 去掉字符串两边的所有标点符号
         structure = structure.strip("{}")
-        # 加上 {}
         structure = "{" + structure + "}"
         structure_json = json.loads(structure)
         structure_json["type"] = question_type
         print(f"response structure: {structure}")
-
-        # 4.1 将去除的定冠词重新加回去
         for key, value in definite_words_map.items():
             for structure in ["subject", "predicative", "adverbial", "complement"]:
                 if structure_json[structure] is None or structure_json[structure] == "":
@@ -578,7 +568,6 @@ def deepthink_infer_by_file(file_path, input_text):
 
         print(f"relocate structure: {structure_json}")
 
-        # 4.2 去除特殊疑问词
         for key, value in structure_json.items():
             if value is None:
                 continue
@@ -586,7 +575,6 @@ def deepthink_infer_by_file(file_path, input_text):
                 if word in value.lower().split(" "):
                     structure_json[key] = value.lower().replace(word, "the")
 
-        # 4.3 特殊疑问句将主语上添加限定词
         indefinite_words = ["some", "any", "all", "both",
                             "each", "every", "many", "much", "few"]
         if structure_json["subject"] is not None:
@@ -605,11 +593,9 @@ def deepthink_infer_by_file(file_path, input_text):
                     structure_json["subject"] = "The " + \
                         structure_json["subject"].lower()
 
-        # 4.4 如果系动词是being, 则改为is
         if structure_json["linking_verb"] == "being":
             structure_json["linking_verb"] = "is being"
 
-        # 4.5 优化表语
         if structure_json['adverbial'] is not None and structure_json["predicative"] is not None:
             common = longest_common_word_substring(
                 structure_json["adverbial"], structure_json["predicative"])
@@ -621,7 +607,6 @@ def deepthink_infer_by_file(file_path, input_text):
             structure_json["predicative"] = structure_json["predicative"].replace(
                 common, "").strip()
 
-        # 4.6 将所有字符串中的"  "替换为" "
         for key, value in structure_json.items():
             if value is not None:
                 structure_json[key] = value.replace("  ", " ")
@@ -634,7 +619,6 @@ def deepthink_infer_by_file(file_path, input_text):
     if question.startswith("how many"):
         structure_json = None
 
-    # 5. 获取手术视频描述
     messages = []
     messages.append({
         "role": "user",
@@ -653,12 +637,10 @@ def deepthink_infer_by_file(file_path, input_text):
     description_json = json.loads(description)
     description_json["summary_describing"] = "This is a description of endoscopic or laparoscopic surgery."
 
-    # 5.1 利用检测模型过滤器械列表
     description_json = filter_tools(file_path, description_json)
     description_json["used_tools_and_function"] = {k.lower(): v for k,
                                                    v in description_json["used_tools_and_function"].items()}
 
-    # 5.2 修正器械功能描述
     for key, value in description_json["used_tools_and_function"].items():
         if "monopolar curved scissors" in key:
             description_json["used_tools_and_function"][key] = "used to cut and coagulate tissues."
@@ -687,7 +669,6 @@ def deepthink_infer_by_file(file_path, input_text):
         if "prograsp forceps" in key:
             description_json["used_tools_and_function"][key] = "this is one kind of forceps, used to strongly grasp and retract tissues."
 
-    # 5.3 修正操作器官和组织列表
     description_json["operated_organ_and_tissue"] = [
         v.lower() for v in description_json["operated_organ_and_tissue"]]
     for i in range(len(description_json["operated_organ_and_tissue"])):
@@ -696,7 +677,6 @@ def deepthink_infer_by_file(file_path, input_text):
     description_json["operated_organ_and_tissue"] = list(
         set(description_json["operated_organ_and_tissue"]))
 
-    # 5.4 添加附加信息
     TOOL_ACTIONS_MAP = {
         "scissors": [
             "cut",
@@ -775,52 +755,13 @@ def deepthink_infer_by_file(file_path, input_text):
     description_json["actions"] = list(set(actions_list))
     description_json["consumables"] = list(set(consumables_list))
 
-    # 5.5 删除task_description和matched_description（可能造成幻觉）
+    # 5.5 delete task_description and matched_description
     # if "task_description" in description_json:
     #     description_json.pop("task_description")
     # if "matched_description" in description_json:
     #     description_json.pop("matched_description")
     print(description_json)
 
-    # # 6 回答用户问题
-    # prompt = f"""You are a precise question answering assistant. You are given a laparoscopic surgery(endoscopic surgery) video description.
-    # You are only allowed to answer based on the Video description to answer the user's question.Do NOT add any information not contained in the description.
-    # There should be logic before and after answering.
-    # Your task is to answer questions strictly following the predefined response style.
-
-    # Answering Rules:
-    #     1. instrument presence questions:
-    #     - If instrument exists, answer with: "Yes, [instrument] are being used." / "Yes, a [instrument] was used."
-    #     - If instrument does not exist, answer with: "No [instrument] are being used." / "No [instrument] is being used."
-
-    #     2. what type of [instrument class] is mentioned?
-    #     - Answer with one short sentence starting with "The type of [instrument class] mentioned is [instrument]"
-
-    #     3. used_tools_and_function list check questions ("Is a [instrument] among the listed tools?"):
-    #     - If listed: "Yes, a [instrument] is listed."
-    #     - If not listed: "No, a [instrument] is not listed."
-
-    #     4. actions list check questions ("Is a [action] required in this surgical step?"):
-    #     - Answer with yes/no + requirement:
-    #         e.g., "Yes, the procedure involves [action]." / "No, [action] are not required."
-
-    #     5. Requirement questions ("Is a [task] required in this surgical step?"):
-    #     - Answer with yes/no + requirement:
-    #         e.g., "Yes, the procedure involves [action]." / "No, [task] are not required."
-
-    #     6. Purpose/function questions ("What is the purpose of using forceps in this procedure?"):
-    #     - Answer with: "The purpose of [tool] is to [function]."
-
-    #     7. Organ/tissue manipulation questions ("What organ is being manipulated?"):
-    #     - Answer with one short sentence starting with: The organ being manipulated is the [organ]."
-
-    # Video description:
-    # {description_json}
-
-    # Now please answer the following question:
-    # {input_text}
-
-    # """
 
     ###########################################
     import pandas as pd
@@ -829,17 +770,16 @@ def deepthink_infer_by_file(file_path, input_text):
     mapping = {row["commercial_toolname"].lower(): row["groundtruth_toolname"]
                for _, row in df_tool.iterrows()}
 
-    # 2. 构建新的 used_tools_and_function
+    # 2. build new used_tools_and_function
     new_used_tools_and_function = {}
     for tool, func in description_json["used_tools_and_function"].items():
         tool_lower = tool.lower()
         if tool_lower in mapping:
             new_tool = mapping[tool_lower]
         else:
-            new_tool = tool  # 如果没找到就保留原名
+            new_tool = tool
         new_used_tools_and_function[new_tool] = func
 
-    # 3. 新建一个新的 description_json_gtool
     description_json_gtool = description_json.copy()
     description_json_gtool["used_tools_and_function"] = new_used_tools_and_function
 
@@ -1005,7 +945,7 @@ def deepthink_infer_by_file(file_path, input_text):
 
     print(f"response answer: {response}")
 
-    # 7 简化答案
+    # simplify the answer
     answer_word_num = len(response.split(" "))
     
     if structure_json is not None and answer_word_num > 8:
@@ -1065,19 +1005,15 @@ def deepthink_infer_by_file(file_path, input_text):
         })
         response = infer_by_message(messages, model)
         print(f"answer simplify: {response}")
-
-    # 去掉response两端的双引号
+    
+    # fix the structure
     response = response.strip('""')
     response = response.lower()
     response = response.strip('.')
-
-    # 只保留'.'或者';'之前的句子
     if '.' in response:
         response = response.split('.')[0]
     if ';' in response:
         response = response.split(';')[0]
-
-    # 截断过长语段
     split_response = response.split(", ")
     response_list = split_response[:2] if len(
         split_response) > 2 else split_response
@@ -1085,23 +1021,17 @@ def deepthink_infer_by_file(file_path, input_text):
         response = " and ".join(response_list)
     else:
         response = ", ".join(response_list)
-
-    # 词语替换
     if "of using" in response:
         response = response.replace("of using", "of")
     if "is rectal artery/vein" in response:
         response = response.replace(
             "is rectal artery/vein", "are rectal artery and rectal vein")
-
-    # 去除多余的during
     if len(response.split(" during")[-1].split(" ")) < 4:
         response = " ".join(response.split("during")[:-1])
     if len(response.split(" during")[0].split(" ")) >= 8:
         response = response.split(" during")[0]
 
     question = input_text.strip(string.punctuation).lower().split(" ")
-
-    # 修正特殊词汇
     definite_words = ["being"]
     definite_words_map = {}
     for word in definite_words:
@@ -1119,125 +1049,10 @@ def deepthink_infer_by_file(file_path, input_text):
                 if response_word_list[index - 1] != value:
                     response_word_list.insert(index-1, value)
                     response = response.replace(key, value + " " + key)
-
-    # response 首字母大写
     response = response.strip()
     response += '.'
     response = response.capitalize()
     print(f"answer: {response}")
-
-    return response
-
-def infer(file_path, input_text):
-    description_question = [
-        "What is the used_tools_and_function? answer in json format",
-        "What is the operated_organ_and_tissue? answer in json format",
-        "What is the task_name, task_description and matched_description? answer in json format",
-        "Analyze the surgical procedure in the video and provide a structured JSON output with keys: used_tools_and_function, operated_organ_and_tissue, task_name, task_description, matched_description"
-    ]
-
-    # 1. get the description of the surgery
-    messages = []
-    messages.append({
-        "role": "user",
-        "content": [
-            {
-                "type": "video",
-                    "video": f"{file_path}",
-                    "resized_height": 480,
-                    "resized_width": 854,
-                },
-            {"type": "text", "text": description_question[3]},
-        ],
-    })
-
-    description = infer_by_message(messages, model)
-    description_json = json.loads(description)
-    if ("monopolar curved scissors" in description_json["used_tools_and_function"].keys()):
-            description_json["used_tools_and_function"]["monopolar curved scissors"] = "used for precise tissue cutting and dissection, while also providing monopolar electrosurgical energy for cutting and coagulation during minimally invasive procedures."
-
-    # 2. get the actions of the surgery
-    action_list = ["dissection", "cut tissue", "hemostasis", "suture", "knotting",
-                "resection", "specimen retrieval", "irrigation", "suction", "anastomosis"]
-    prompt = f"""
-        You are given a description of a laparoscopic (endoscopic) surgery scene.  
-    From the following action list: {action_list}, identify all the actions that are explicitly present in the description.  
-
-    Surgery description: "{description}"  
-
-    Output only a Python list of the selected actions.  
-    Do not include any actions outside of {action_list}. 
-    
-    """
-    messages = []
-    messages.append({
-        "role": "user",
-        "content": [
-            {"type": "text", "text": prompt},
-        ],
-    })
-
-    actions = infer_by_message(messages, model)
-    actions_list = [x.strip().strip("'")
-                    for x in actions.strip("[]").split(",")]
-    if 'suture' in actions_list and 'cut tissue' in actions_list:
-        actions_list.remove('cut tissue')
-    description_json["actions"] = actions_list
-
-    # 3. answer the user's question
-    prompt = f"""
-        You are a precise question answering assistant. You are given a laparoscopic surgery(endoscopic surgery) video description.
-    You are only allowed to answer based on the Video description to answer the user's question.Do NOT add any information not contained in the description.
-    There should be logic before and after answering.
-    Your task is to answer questions strictly following the predefined response style.
-    
-    Answering Rules:
-        1. instrument presence questions(used_tools_and_function contains the instrument in use):
-        - If a tool is explicitly listed in used_tools_and_function, answer with: "Yes, [instrument] are being used." / "Yes, a [instrument] was used."
-        - If a tool is not listed in used_tools_and_function, answer with: "No [instrument] are being used." / "No [instrument] is being used."
-
-        2. what type of [instrument class] is mentioned?
-        - Answer with one short sentence starting with "The type of [instrument class] mentioned is [instrument]"
-
-        3. used_tools_and_function list check questions ("Is a [instrument] among the listed tools?"):
-        - If listed: "Yes, a [instrument] is listed."
-        - If not listed: "No, a [instrument] is not listed."
-
-        4. actions list check questions ("Is a [action] required in this surgical step?"):
-        - Answer with yes/no + requirement: 
-            e.g., "Yes, the procedure involves [action]." / "No, [action] are not required."
-        
-        5. Requirement questions ("Is a [task] required in this surgical step?"):
-        - Answer with yes/no + requirement: 
-            e.g., "Yes, the procedure involves [action]." / "No, [task] are not required."
-
-        6. Organ/tissue manipulation questions ("What organ is being manipulated?"):
-        - Answer with one short sentence starting with: The organ being manipulated is the [organ]."
-
-        7. Procedure identification questions ("What procedure is this summary describing?"):
-        - Answer with one short sentence starting with "The summary is describing [procedure]."
-
-        8. Purpose/function questions ("What is the purpose of using [tool] in this procedure?"):
-        - Answer with one short sentence starting with: "The [tool] are used for [function]."
-
-
-    Video description:
-    {description_json}
-
-    User question:
-    {input_text}
-    Answer concisely, logically, and less than 10 words
-    """
-
-    messages = []
-    messages.append({
-        "role": "user",
-        "content": [
-            {"type": "text", "text": prompt},
-        ],
-    })
-
-    response = infer_by_message(messages, model)
 
     return response
 
