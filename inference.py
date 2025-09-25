@@ -34,33 +34,31 @@ from timm.models import create_model
 import torchvision.transforms as transforms
 import string
 
-INPUT_PATH = Path("/input")
-OUTPUT_PATH = Path("/output")
-MODEL_PATH = Path("/opt/app/model")
+# INPUT_PATH = Path("/input")
+# OUTPUT_PATH = Path("/output")
+# MODEL_PATH = Path("/opt/app/model")
 
-# INPUT_PATH = Path(
-#     "/data/lxy/code/surgvu2025-category2-submission/test/input")
-# OUTPUT_PATH = Path(
-#     "/data/lxy/code/surgvu2025-category2-submission/test/output")
-# MODEL_PATH = Path("/data/lxy/code/surgvu2025-category2-submission/model")
+INPUT_PATH = Path("./test/input")
+OUTPUT_PATH = Path("./test/output")
+MODEL_PATH = Path("./model")
 
 RESOURCE_PATH = Path("resources")
 
-# # Global model and processor variables
-# model = None
-# processor = None
 
 def log_cuda_memory(message):
     print(f"========== {message} ==========")
-    print("Allocated:", torch.cuda.memory_allocated(device="cuda:0")/1024**2, "MB")
-    print("Reserved :", torch.cuda.memory_reserved(device="cuda:0")/1024**2, "MB")
-    print("Max Allocated:", torch.cuda.max_memory_allocated(device="cuda:0")/1024**2, "MB")
+    print("Allocated:", torch.cuda.memory_allocated(
+        device="cuda:0")/1024**2, "MB")
+    print("Reserved :", torch.cuda.memory_reserved(
+        device="cuda:0")/1024**2, "MB")
+    print("Max Allocated:", torch.cuda.max_memory_allocated(
+        device="cuda:0")/1024**2, "MB")
     os.system("nvidia-smi")
 
 
 def load_model():
     """Load the model and processor globally"""
-    
+
     global config
     config = configparser.ConfigParser()
     config.read(os.path.join(MODEL_PATH, "alg.cfg"), encoding='utf-8')
@@ -70,19 +68,18 @@ def load_model():
     cls_model_path = os.path.join(MODEL_PATH, "checkpoint-399.pth")
     device = "cuda" if torch.cuda.is_available() else "cpu"
 
-    # 初始化检测模型
+    # load detect model
     from ultralytics.utils import LOGGER
-    LOGGER.setLevel(logging.ERROR)  # 只显示错误
+    LOGGER.setLevel(logging.ERROR)
     from ultralytics import YOLO
     det_model = YOLO(det_model_path)
-
-    # 分类模型可选，如果不需要可以设置为 None
+    # load classify model
     cls_model = create_model("resnet50", pretrained=False, num_classes=12)
     import numpy as np
     # with torch.serialization.safe_globals([np.core.multiarray.scalar]):
     checkpoint = torch.load(
         cls_model_path, map_location="cpu", weights_only=False)['model']
-    # 这里假设 load_state_dict 函数已定义
+
     load_state_dict(cls_model, checkpoint)
     cls_model.to(device)
     cls_model.eval()
@@ -93,7 +90,7 @@ def load_model():
     ])
 
     global model, processor
-    
+
     # Load model from the checkpoint directory
     model = Qwen2_5_VLForConditionalGeneration.from_pretrained(
         MODEL_PATH,  # Updated path for container
@@ -108,22 +105,19 @@ def load_model():
 
 def build_qwen_input_by_file(messages, frames=4):
     try:
-        # 处理视频
         vision_process.FPS_MAX_FRAMES = frames
         vision_process.FPS_MIN_FRAMES = frames
         image_inputs, video_inputs = process_vision_info(
-            messages)  # 获取数据（预处理过）
+            messages)
 
     except Exception as e:
         print(f"处理视频文件时出错: {e}")
         return None
 
-    # 获取文本
     text = processor.apply_chat_template(
         messages, tokenize=False, add_generation_prompt=True
     )
 
-    # 获取输入
     inputs = processor(
         text=[text],
         # images=image_inputs,
@@ -133,6 +127,7 @@ def build_qwen_input_by_file(messages, frames=4):
     )
 
     return inputs
+
 
 def infer_by_message(messages, model):
     inputs = build_qwen_input_by_file(messages, frames=4).to("cuda")
@@ -196,21 +191,20 @@ def load_state_dict(model, state_dict, prefix='', ignore_missing="relative_posit
     if len(error_msgs) > 0:
         print('\n'.join(error_msgs))
 
+
 def extract_tools_list(video_path, det_model, id_label_dict, cls_model=None, cls_transform=None, device="cuda"):
-    """
-    输入视频路径，返回视频中出现过的手术工具列表（去重）。
-    """
+
     import cv2
     import torch
     import numpy as np
     from PIL import Image
     cap = cv2.VideoCapture(video_path)
-    fps = int(cap.get(cv2.CAP_PROP_FPS))  # 帧率
-    frame_interval = max(fps * 1, 1)      # 每 2 秒取一帧
+    fps = int(cap.get(cv2.CAP_PROP_FPS))
+    frame_interval = max(fps * 1, 1)
     frame_idx = 0
 
     tools_set = set()
-    prev_tools = set()  # 保存上一帧的检测结果
+    prev_tools = set()
 
     while cap.isOpened():
         success, frame = cap.read()
@@ -220,7 +214,7 @@ def extract_tools_list(video_path, det_model, id_label_dict, cls_model=None, cls
         if frame_idx % frame_interval == 0:
             current_tools = set()
 
-            # 检测
+            # detect
             det_res = det_model.predict(frame, conf=0.65, iou=0.3)[0]
             boxes = det_res.boxes.xyxy.cpu().numpy().astype(np.int32)
             clses = det_res.boxes.cls.cpu().numpy().astype(np.int32)
@@ -229,7 +223,7 @@ def extract_tools_list(video_path, det_model, id_label_dict, cls_model=None, cls
                 det_cls = clses[i]
                 det_label = id_label_dict[det_cls]
 
-                # 可选分类模型
+                # use classify model
                 if cls_model is not None and cls_transform is not None:
                     x1, y1, x2, y2 = boxes[i]
                     h, w = frame.shape[:2]
@@ -242,26 +236,27 @@ def extract_tools_list(video_path, det_model, id_label_dict, cls_model=None, cls
                         crop = frame[ymin:ymax, xmin:xmax, :]
                         crop_rgb = cv2.cvtColor(crop, cv2.COLOR_BGR2RGB)
                         crop_rgb = Image.fromarray(crop_rgb)
-                        image_trans = cls_transform(crop_rgb).unsqueeze(0).to(device)
+                        image_trans = cls_transform(
+                            crop_rgb).unsqueeze(0).to(device)
                         with torch.no_grad():
                             res = cls_model(image_trans)
-                            output = torch.softmax(res, dim=1).detach().cpu().numpy()
+                            output = torch.softmax(
+                                res, dim=1).detach().cpu().numpy()
                             cls_id = np.argmax(output, axis=1)[0]
                             det_label = id_label_dict[cls_id]
 
                 current_tools.add(det_label)
 
-            # 取和上一帧的交集 → 连续两帧都出现的工具才加入最终结果
             stable_tools = prev_tools & current_tools
             tools_set.update(stable_tools)
 
-            # 更新上一帧
             prev_tools = current_tools
 
         frame_idx += 1
 
     cap.release()
     return sorted(list(tools_set))
+
 
 def detect_tool_list(video_path):
     id_label_dict = {0: 'needle driver',
@@ -282,10 +277,9 @@ def detect_tool_list(video_path):
 
     return tools_list
 
+
 def load_commercial2gt(csv_path):
-    """
-    读取 CSV, 返回 commercial2gt 映射 (lowercase key)
-    """
+
     mapping = {}
     with open(csv_path, "r", encoding="utf-8-sig") as f:
         reader = csv.DictReader(f)
@@ -295,13 +289,9 @@ def load_commercial2gt(csv_path):
             mapping[c_name] = g_name
     return mapping
 
+
 def merge_tools(video_description, tools_list, commercial2gt):
-    """
-    合并检测模型 tools_list 和 Qwen 输出的 JSON
-    - tools_list 决定最终有哪些工具
-    - 如果 Qwen 有对应描述，就优先保留它的 commercial 名
-    - 否则用 groundtruth 名
-    """
+    
     gt_tools_function_map = {
         "monopolar curved scissors": "Used for tissue cutting and dissection, providing monopolar electrosurgical energy for cutting and coagulation.",
         "force bipolar": "Used for tissue cutting and dissection, providing bipolar electrosurgical energy for cutting and coagulation.",
@@ -326,14 +316,12 @@ def merge_tools(video_description, tools_list, commercial2gt):
     def normalize_name(name):
         return name.strip().lower()
 
-    # Step 1. 把检测模型输出 tools_list 映射到 groundtruth
     detect_tools = set()
     for tool in tools_list:
         tool_norm = normalize_name(tool)
         gt_name = commercial2gt.get(tool_norm, tool)
         detect_tools.add(gt_name)
 
-    # Step 2. 遍历 Qwen 输出
     description_tools = {}
     description_tools_gt = {}
     description_tools_func = {}
@@ -367,22 +355,19 @@ def merge_tools(video_description, tools_list, commercial2gt):
         else:
             merged[gt_name.capitalize()] = " "
 
-    tool_list = [tool.lower() for tool in description_tools.values()]
-    gt_tools_list = [tool.lower() for tool in detect_tools]
-    if "cadiere forceps" in tool_list and "needle driver" in gt_tools_list:
-        merged["cadiere forceps"] = "this is one kind of forceps, used to grasp and hold tissues or objects."
-
-    # 现在是 dict，可以安全更新
     video_description["used_tools_and_function"] = merged
     return video_description
 
+
 def filter_tools(file_path, description_json):
-    use_tools_filter = config.getboolean('ALG', 'use_tools_filter', fallback=True)
+    use_tools_filter = config.getboolean(
+        'ALG', 'use_tools_filter', fallback=True)
     if use_tools_filter:
         tools_list = detect_tool_list(file_path)
         commercial2gt = load_commercial2gt(
             os.path.join(MODEL_PATH, "toolname_mapping_filter.csv"))
-        description_json = merge_tools(description_json, tools_list, commercial2gt)
+        description_json = merge_tools(
+            description_json, tools_list, commercial2gt)
     return description_json
 
 
@@ -402,7 +387,6 @@ def longest_common_word_substring(s1, s2):
             else:
                 m[i][j] = 0
 
-    # 拼接成字符串
     return " ".join(words1[end_index - longest:end_index])
 
 
@@ -413,7 +397,7 @@ def is_forceps_type_question(text: str) -> bool:
     return (
         "forceps" in text
         and any(word in text for word in type_synonyms)
-        and any(q in text.split() for q in question_words)  # 确保是真问题
+        and any(q in text.split() for q in question_words)
     )
 
 
@@ -451,6 +435,7 @@ def deepthink_infer_by_file(file_path, input_text):
     else:
         question_type = "normal"
 
+    # 3. analyze the structure of the question
     structure_prompt = f"""You are a linguistic analyzer.  
     Your task is to analyze the grammatical structure of the given English sentence.
 
@@ -552,12 +537,12 @@ def deepthink_infer_by_file(file_path, input_text):
     structure = infer_by_message(messages, model)
 
     try:
-
         structure = structure.strip("{}")
         structure = "{" + structure + "}"
         structure_json = json.loads(structure)
         structure_json["type"] = question_type
         print(f"response structure: {structure}")
+
         for key, value in definite_words_map.items():
             for structure in ["subject", "predicative", "adverbial", "complement"]:
                 if structure_json[structure] is None or structure_json[structure] == "":
@@ -616,9 +601,7 @@ def deepthink_infer_by_file(file_path, input_text):
         print(f"Error: {e}")
         structure_json = None
 
-    if question.startswith("how many"):
-        structure_json = None
-
+    # get the description of the surgery video
     messages = []
     messages.append({
         "role": "user",
@@ -755,13 +738,11 @@ def deepthink_infer_by_file(file_path, input_text):
     description_json["actions"] = list(set(actions_list))
     description_json["consumables"] = list(set(consumables_list))
 
-    # 5.5 delete task_description and matched_description
-    # if "task_description" in description_json:
-    #     description_json.pop("task_description")
-    # if "matched_description" in description_json:
-    #     description_json.pop("matched_description")
+    if "task_description" in description_json:
+        description_json.pop("task_description")
+    if "matched_description" in description_json:
+        description_json.pop("matched_description")
     print(description_json)
-
 
     ###########################################
     import pandas as pd
@@ -770,7 +751,6 @@ def deepthink_infer_by_file(file_path, input_text):
     mapping = {row["commercial_toolname"].lower(): row["groundtruth_toolname"]
                for _, row in df_tool.iterrows()}
 
-    # 2. build new used_tools_and_function
     new_used_tools_and_function = {}
     for tool, func in description_json["used_tools_and_function"].items():
         tool_lower = tool.lower()
@@ -853,7 +833,6 @@ def deepthink_infer_by_file(file_path, input_text):
         6. Organ/tissue manipulation questions ("What organ is being manipulated?"):
         - Answer with one short sentence starting with: The organ being manipulated is the [organ]."
 
-
     Video description:
     {description_json_gtool}
     
@@ -873,7 +852,7 @@ def deepthink_infer_by_file(file_path, input_text):
 
     linking_verbs = ['is', 'are', 'was', 'were', 'has', 'have', 'had',  'will', 'would', 'shall', 'should',
                      'can', 'could', 'may', 'might', 'must']
-    answer_p = "[concise answer the question]"
+    answer_p = "[answer from Video description]"
     if structure_json is not None and structure_json["linking_verb"] is not None and structure_json["subject"] is not None and structure_json["predicative"] is not None:
         is_question = False
         for word in special_words + linking_verbs + ["do", "does", "did"]:
@@ -947,25 +926,16 @@ def deepthink_infer_by_file(file_path, input_text):
 
     # simplify the answer
     answer_word_num = len(response.split(" "))
-    
     if structure_json is not None and answer_word_num > 8:
-        if structure_json["subject"] is not None and structure_json["predicative"] is not None:
-            w = structure_json["predicative"].split(" ")[0]
-            if w.endswith("ed"):
-                subject = f"""{structure_json["subject"]} {w}"""
-            elif structure_json["predicative"].startswith("of") or structure_json["predicative"].startswith("being"):
-                subject = f"""{structure_json["subject"]} {structure_json["predicative"]}"""
-            else:
-                subject = structure_json["subject"]
-            task = f"""Keep the subject "{subject}" unchanged."""
-        else:
-            task = f"""Keep the subject unchanged."""
-        
+
+        subject = structure_json["subject"] if structure_json["type"] == "normal" else structure_json["subject"] + \
+            " " + structure_json["predicative"]
+
         prompt_rebuild = f"""you are an assistant that simplifies sentence.
         Task:
-        
-        {task}
-        
+
+        Keep the subject "{subject}" and the linking verb "{structure_json["linking_verb"]}" unchanged.
+
         Ensure the entire sentence is no more than 11 words.
 
         Do not change the sentence structure (remain subject + linking verb + complement).
@@ -1005,8 +975,7 @@ def deepthink_infer_by_file(file_path, input_text):
         })
         response = infer_by_message(messages, model)
         print(f"answer simplify: {response}")
-    
-    # fix the structure
+
     response = response.strip('""')
     response = response.lower()
     response = response.strip('.')
@@ -1030,7 +999,6 @@ def deepthink_infer_by_file(file_path, input_text):
         response = " ".join(response.split("during")[:-1])
     if len(response.split(" during")[0].split(" ")) >= 8:
         response = response.split(" during")[0]
-
     question = input_text.strip(string.punctuation).lower().split(" ")
     definite_words = ["being"]
     definite_words_map = {}
@@ -1056,13 +1024,12 @@ def deepthink_infer_by_file(file_path, input_text):
 
     return response
 
-
 def run():
     # log_cuda_memory("before load model")
     # Load model first
     load_model()
     # log_cuda_memory("after load model")
-    
+
     # The key is a tuple of the slugs of the input sockets
     interface_key = get_interface_key()
     print("Inputs: ", interface_key)
@@ -1080,7 +1047,8 @@ def run():
 
 def interf0_handler():
     # Read the input
-    input_endoscopic_robotic_surgery_video = INPUT_PATH / "endoscopic-robotic-surgery-video.mp4"
+    input_endoscopic_robotic_surgery_video = INPUT_PATH / \
+        "endoscopic-robotic-surgery-video.mp4"
     input_visual_context_question = load_json_file(
         location=INPUT_PATH / "visual-context-question.json",
     )
@@ -1088,19 +1056,18 @@ def interf0_handler():
 
     # Prepare video messages for the model
     video_path = str(input_endoscopic_robotic_surgery_video)
-    
+
     user_question = input_visual_context_question
     print("Answering question:", user_question)
     answer = deepthink_infer_by_file(video_path, input_visual_context_question)
     # answer = infer("/data/lxy/data/case_154_9_0_part5.mp4", "is needle driver used in this surgery?")
     print("Answer:\n", answer)
 
-    
     # # Save your output
     # output_visual_context_response = {
     #      answer
     # }
-    
+
     write_json_file(
         location=OUTPUT_PATH / "visual-context-response.json",
         content=answer,
@@ -1118,7 +1085,7 @@ def get_interface_key():
     inputs = load_json_file(
         location=INPUT_PATH / "inputs.json",
     )
-    print('These are the inputs:' , inputs)
+    print('These are the inputs:', inputs)
     socket_slugs = [sv["interface"]["slug"] for sv in inputs]
     return tuple(sorted(socket_slugs))
 
@@ -1149,11 +1116,14 @@ def _show_torch_cuda_info():
 
     print("=+=" * 10)
     print("Collecting Torch CUDA information")
-    print(f"Torch CUDA is available: {(available := torch.cuda.is_available())}")
+    print(
+        f"Torch CUDA is available: {(available := torch.cuda.is_available())}")
     if available:
         print(f"\tnumber of devices: {torch.cuda.device_count()}")
-        print(f"\tcurrent device: { (current_device := torch.cuda.current_device())}")
-        print(f"\tproperties: {torch.cuda.get_device_properties(current_device)}")
+        print(
+            f"\tcurrent device: { (current_device := torch.cuda.current_device())}")
+        print(
+            f"\tproperties: {torch.cuda.get_device_properties(current_device)}")
     print("=+=" * 10)
 
 
